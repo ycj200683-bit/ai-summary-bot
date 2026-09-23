@@ -1,25 +1,29 @@
 """
-项目①：大模型文本摘要器 v0.2（W5 OOP 重构版）
+项目①：大模型文本摘要器 v0.3（W6 装饰器版）
 作者：俊 ｜ 方向：B（大模型应用 / AI 产品）
 
-v0.2 变化：
-  把 v0.1 里散落的函数，按"职责"包成 3 个类：
-    Config     —— 只负责"装配置"（key、模型、温度、系统提示词）
-    LLMClient  —— 只负责"怎么跟 API 说话"（发请求、处理错误）
-    Summarizer —— 只负责"业务"（给一段文本，返回摘要）
+v0.3 变化：
+  新增 @retry(max_tries=3, backoff=1.0) 装饰器，套在 LLMClient.chat 上：
+    - 遇到 RetryableError（超时 / 网络抖动 / 429 限流 / 5xx）→ 等待后自动重试
+    - 遇到 FatalError（401 key 错 / 402 余额不足）→ 立刻抛出，不做无谓等待
+    - 等待时间指数退避：1 秒 → 2 秒 → 4 秒……（避免把对方打得更堵）
 
-  这样拆的好处：以后要换模型 → 只改 Config；
-                要换 API 厂商 → 只改 LLMClient；
-                Summarizer（业务逻辑）一行都不用动。
+  装饰器的价值：chat() 一个字的业务代码都没改，就获得了重试能力。
+  这就是"横切关注点"（日志、重试、计时、鉴权）该放的地方。
+
+v0.2 变化：
+  把散落的函数按职责包成 3 个类：Config / LLMClient / Summarizer。
 
 用法：
   python main.py --file sample.txt
-  python main.py --file sample.txt --length 5   # 指定摘要句数（练手小任务）
+  python main.py --file sample.txt --length 5   # 指定摘要句数
 
 依赖：requests
 """
 
 import os
+import time
+import functools
 import argparse
 from dataclasses import dataclass
 
@@ -76,6 +80,38 @@ class FatalError(LLMError):
 
 
 # ============================================================
+# 2.5) @retry 装饰器：给任何函数套上"失败自动重试"的能力
+#      三层嵌套：retry(收参数) → decorator(收函数) → wrapper(真正执行)
+# ============================================================
+def retry(max_tries: int = 3, backoff: float = 1.0):
+    """
+    失败自动重试的装饰器（指数退避）。
+
+    max_tries : 最多执行几次（含第一次）
+    backoff   : 第一次重试等多少秒，之后每次翻倍（1s → 2s → 4s……）
+
+    只对 RetryableError 重试；其它异常原样抛出，立即失败。
+    """
+    def decorator(func):
+        # @functools.wraps 保留原函数的名字和文档，不然会被 wrapper 顶掉
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            wait = backoff
+            for attempt in range(1, max_tries + 1):
+                try:
+                    return func(*args, **kwargs)          # 正常时直接返回，什么都不用管
+                except RetryableError as e:
+                    if attempt == max_tries:
+                        # 次数用完了，把错误抛给上层（main 里会打印提示）
+                        raise
+                    print(f"🔁 第 {attempt} 次失败（{e}），{wait:.0f} 秒后重试……")
+                    time.sleep(wait)
+                    wait *= 2                             # 指数退避：等待时间翻倍
+        return wrapper
+    return decorator
+
+
+# ============================================================
 # 3) LLMClient：只负责"怎么跟大模型 API 说话"
 # ============================================================
 class LLMClient:
@@ -93,10 +129,14 @@ class LLMClient:
         # 把传进来的配置"存"到对象身上，之后所有方法都能用
         self.config = config
 
+    # ↓ 装饰器就加在这一行：chat() 内部代码一个字没改，却自动获得了重试能力
+    @retry(max_tries=3, backoff=1.0)
     def chat(self, system_prompt: str, user_prompt: str) -> str:
         """
         发一次对话请求，返回模型回复的文本。
-        出错时不返回 None，而是"抛出"对应的异常，让调用方决定怎么处理。
+        出错时不返回 None，而是"抛出"对应的异常，让调用方决定怎么处理：
+          RetryableError → 会被上面的 @retry 自动重试
+          FatalError     → 直接抛出，不重试
         """
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
@@ -203,9 +243,10 @@ def main():
         print("\n--- 摘要结果 ---\n")
         print(bot.summarize(text))
     except RetryableError as e:
-        print(f"🔁 出了可重试的错误：{e}")
+        print(f"🔁 重试 3 次后仍然失败：{e}")
+        print("   常见原因：网络不稳 / 429 被限流 / 服务端 5xx，稍后再试。")
     except FatalError as e:
-        print(f"❌ 出了不该重试的错误：{e}")
+        print(f"❌ {e}")
 
 
 if __name__ == "__main__":
