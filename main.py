@@ -1,6 +1,13 @@
 """
-项目①：大模型文本摘要器 v0.3（W6 装饰器版）
+项目①：大模型文本摘要器 v0.4（W8 日志版）
 作者：俊 ｜ 方向：B（大模型应用 / AI 产品）
+
+v0.4 变化（W8）：
+  引入 logging，替代散落的 print。判断标准只有一条：
+    - 给【开发者】看的记录（重试、读文件、出错原因）→ logger.info / warning / error
+    - 给【用户】看的输出（界面提示、摘要正文）    → 保留 print
+  日志同时打到终端和 logs/app.log；
+  FileHandler 必须写 encoding="utf-8"，否则 Windows 上中文日志会乱码。
 
 v0.3 变化：
   新增 @retry(max_tries=3, backoff=1.0) 装饰器，套在 LLMClient.chat 上：
@@ -28,6 +35,20 @@ import argparse
 from dataclasses import dataclass
 
 import requests
+import logging
+
+os.makedirs("logs", exist_ok=True)          # 没有 logs/ 目录就建一个
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),                                        # 打到终端
+        logging.FileHandler("logs/app.log", encoding="utf-8"),          # 存到文件
+    ],
+)
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -104,7 +125,9 @@ def retry(max_tries: int = 3, backoff: float = 1.0):
                     if attempt == max_tries:
                         # 次数用完了，把错误抛给上层（main 里会打印提示）
                         raise
-                    print(f"🔁 第 {attempt} 次失败（{e}），{wait:.0f} 秒后重试……")
+                    # ★W8 改动①：重试属于"开发者记录"，用户不用知道，但排障要查 → warning
+                    #   用 %s/%.0f 而不是 f-string：日志级别没开启时不做多余的字符串拼接
+                    logger.warning("🔁 第 %s 次失败（%s），%.0f 秒后重试……", attempt, e, wait)
                     time.sleep(wait)
                     wait *= 2                             # 指数退避：等待时间翻倍
         return wrapper
@@ -223,14 +246,17 @@ def main():
     # 1. 拿到要摘要的文本
     if args.file:
         text = read_text_file(args.file)
-        print(f"📄 已读取文件：{args.file}（{len(text)} 字）")
+        # ★W8 改动②：读了哪个文件、多少字 —— 运行信息，给开发者看 → info（保留 print 的只有"给用户看"的）
+        logger.info("📄 已读取文件：%s（%s 字）", args.file, len(text))
     else:
+        # ↓ 以下两行是【给用户看的界面】，不动
         print("=== 大模型文本摘要器 ===")
         print("提示：长文本请用 --file 参数（input() 一次只能读一行）")
         text = input("粘贴要摘要的文本（输入后回车）：\n")
 
     if not text.strip():
-        print("没有输入文本，退出。")
+        # ★W8 改动③：输入为空属于异常输入 → warning
+        logger.warning("没有输入文本，退出。")
         return
 
     # 2. 组装：配置 → 客户端 → 摘要器（这就是"把东西串起来"）
@@ -240,13 +266,17 @@ def main():
 
     # 3. 调用 + 兜住异常
     try:
+        # ↓ 这两行是【给用户的最终输出】，必须保留 print！
+        #   ⚠ 尤其 print(bot.summarize(text)) —— 改成 logger 用户就看不到摘要了
         print("\n--- 摘要结果 ---\n")
         print(bot.summarize(text))
     except RetryableError as e:
-        print(f"🔁 重试 3 次后仍然失败：{e}")
-        print("   常见原因：网络不稳 / 429 被限流 / 服务端 5xx，稍后再试。")
+        # ★W8 改动④：真正的失败，等级最高 → error
+        logger.error("🔁 重试 3 次后仍然失败：%s", e)
+        print("   常见原因：网络不稳 / 429 被限流 / 服务端 5xx，稍后再试。")   # 给用户的提示 → 保留
     except FatalError as e:
-        print(f"❌ {e}")
+        # ★W8 改动⑤：key 错 / 余额不足这类不可恢复错误 → error
+        logger.error("❌ %s", e)
 
 
 if __name__ == "__main__":
