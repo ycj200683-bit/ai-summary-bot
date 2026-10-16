@@ -10,14 +10,21 @@ pytest 测试 —— 项目① 大模型文本摘要器（W7）
       由我们自己决定它返回什么，从而随心所欲地造出 200 / 401 / 429 各种情况。
 
 本文件里有：
-  ✅ 2 个已经写好的示例（读它们，学会套路）
-  ⬜ 2 个 TODO 待你补（跑 pytest 会显示为 skipped）
+  ✅ 4 个 W7 用例（正常返回 / 401 不重试 / 429 重试成功 / prompt 拼装）
+  ✅ v0.5 新增：配置解析用例（环境变量、默认值、URL 归一化）
 """
 
 import pytest
 
 import main          # 被测对象：项目根目录的 main.py
-from main import Config, LLMClient, Summarizer, RetryableError, FatalError
+from main import (
+    Config,
+    LLMClient,
+    Summarizer,
+    RetryableError,
+    FatalError,
+    normalize_api_url,
+)
 
 
 # ============================================================
@@ -123,13 +130,12 @@ def test_chat_401_不重试(monkeypatch):
 
 
 # ============================================================
-# ⬜ TODO 2（轮到你了）：前两次 429，第三次 200 → 应重试成功，共调用 3 次
+# 练习题 2（俊已独立完成 ✅）：前两次 429，第三次 200 → 应重试成功，共调用 3 次
 #
-#   套路和参考实现 1 完全一样，只是多了两个新东西：
+#   新增的两个套路（值得记住）：
 #     ① fake_post 要"看情况返回不同结果"（前两次 429，第三次 200）
 #     ② 必须把 time.sleep 换掉 —— 否则测试会真的干等 1 + 2 = 3 秒
-#
-#   照着下面的骨架填空（把 ___ 和 …… 补上），然后删掉 @pytest.mark.skip 那一行。
+#       （注：那次下划线占位符把你坑了，正确写法是起个名字叫 fake_sleep）
 # ============================================================
 
 def test_chat_429_重试后成功(monkeypatch):
@@ -154,3 +160,147 @@ def test_chat_429_重试后成功(monkeypatch):
     assert result ==  "重试后拿到的摘要"                  # ← 填空：应该返回什么？
     assert calls["n"] == 3                # ← 填空：总共调用几次？
     assert slept == [1.0,2.0]                    # ← 填空：退避等待应该是哪两个数字？
+
+
+# ============================================================
+# v0.5 新增：配置解析测试
+#
+#   为什么这段配置代码特别需要测试？
+#     Config.from_env() 读的是【环境变量】—— 也就是"代码之外的状态"。
+#     这类代码最容易出 bug：key 没设、变量名打错、厂商给的 URL 少一段路径……
+#     而且这些 bug 在你本机跑得好好的（因为你本机设了），一到别人电脑上就炸。
+#     所以必须靠测试 pretend 出各种环境，把每条分支都走一遍。
+#
+#   新工具：monkeypatch.setenv("名", "值") / monkeypatch.delenv("名")
+#     —— 临时改环境变量，测试结束自动还原（和替换 requests.post 是同一招）
+# ============================================================
+
+@pytest.fixture
+def clean_env(monkeypatch):
+    """
+    把所有相关环境变量先清空，保证测试结果只取决于本用例自己设了什么，
+    不受"本机恰好设过 DEEPSEEK_API_KEY"这类外部因素干扰。
+
+    raising=False 的意思是：变量本来就不存在时也别报错（我们就是要它不存在）。
+    """
+    for name in ("API_KEY", "API_BASE_URL", "MODEL_NAME", "DEEPSEEK_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch          # 返回出去，用例里接着用它 setenv
+
+
+# ------------------------------------------------------------
+# URL 归一化：纯函数，最好测 —— 给输入、断言输出，没有任何副作用
+# ------------------------------------------------------------
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        # 只给 base → 自动补上 /chat/completions
+        ("https://api.deepseek.com/v1", "https://api.deepseek.com/v1/chat/completions"),
+        ("http://localhost:11434/v1", "http://localhost:11434/v1/chat/completions"),
+        # 已经是完整 URL → 不能重复拼成 .../chat/completions/chat/completions
+        (
+            "https://api.deepseek.com/v1/chat/completions",
+            "https://api.deepseek.com/v1/chat/completions",
+        ),
+        # 结尾多打一个斜杠（最常见的复制粘贴残留）→ 也要处理干净
+        ("https://api.deepseek.com/v1/", "https://api.deepseek.com/v1/chat/completions"),
+        # 前后不小心带上空格 → strip 掉
+        ("  https://api.openai.com/v1  ", "https://api.openai.com/v1/chat/completions"),
+    ],
+)
+def test_normalize_api_url(raw, expected):
+    assert normalize_api_url(raw) == expected
+
+
+# ------------------------------------------------------------
+# 分支 1：什么都不设，只有 key → 走 DeepSeek 默认值
+# ------------------------------------------------------------
+def test_from_env_默认走_deepseek(clean_env):
+    clean_env.setenv("DEEPSEEK_API_KEY", "sk-legacy")      # 故意用【旧】变量名
+
+    cfg = Config.from_env()
+
+    assert cfg.api_key == "sk-legacy"                      # 旧名字仍然认
+    assert cfg.api_url == "https://api.deepseek.com/v1/chat/completions"
+    assert cfg.model == "deepseek-chat"
+
+
+# ------------------------------------------------------------
+# 分支 2：设了新的三个变量 → 完整切到另一家厂商（这就是 v0.5 的核心卖点）
+# ------------------------------------------------------------
+def test_from_env_可切到其他厂商(clean_env):
+    clean_env.setenv("API_KEY", "sk-new")
+    clean_env.setenv("API_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    clean_env.setenv("MODEL_NAME", "qwen-plus")
+
+    cfg = Config.from_env()
+
+    assert cfg.api_key == "sk-new"
+    # 注意：这里只给了 base，断言的是【补全之后】的完整地址
+    assert cfg.api_url == (
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    )
+    assert cfg.model == "qwen-plus"
+    # 没碰的字段仍用默认值（@dataclass 的好处）
+    assert cfg.temperature == 0.3
+    assert cfg.timeout == 30
+
+
+# ------------------------------------------------------------
+# 分支 3：新旧变量名同时存在 → 新的赢（不然改了没生效会很迷惑）
+# ------------------------------------------------------------
+def test_from_env_新变量名优先于旧变量名(clean_env):
+    clean_env.setenv("DEEPSEEK_API_KEY", "旧key")
+    clean_env.setenv("API_KEY", "新key")
+
+    assert Config.from_env().api_key == "新key"
+
+
+# ------------------------------------------------------------
+# 分支 4：一个 key 都没有 → 必须直接退出，而不是带着空 key 去发请求
+#   （带着空 key 也不是不行，但会拿到 401，还白烧一次重试等待，不如早死早超生）
+# ------------------------------------------------------------
+def test_from_env_没key就退出(clean_env):
+    with pytest.raises(SystemExit):
+        Config.from_env()
+
+
+# ------------------------------------------------------------
+# 分支 5：环境变量被设成【空字符串】→ 也要回退到默认值
+#   这就是 from_env 里用 `os.getenv(...) or 默认值` 而不是
+#   `os.getenv(名, 默认值)` 的原因：后者在"变量存在但为空串"时会返回空串。
+#   在 Windows 上 `$env:API_BASE_URL=""` 恰好就是这个行为，很容易踩。
+# ------------------------------------------------------------
+def test_from_env_空字符串也回退默认值(clean_env):
+    clean_env.setenv("API_KEY", "sk-x")
+    clean_env.setenv("API_BASE_URL", "")
+    clean_env.setenv("MODEL_NAME", "")
+
+    cfg = Config.from_env()
+
+    assert cfg.api_url == "https://api.deepseek.com/v1/chat/completions"
+    assert cfg.model == "deepseek-chat"
+
+
+# ------------------------------------------------------------
+# 404 的报错信息必须带上"去检查哪个变量"
+#
+#   这条测试的由来很有意思：真的去跑"只换端点、忘换模型名"时，
+#   百炼回了 model_not_found，而原来的报错只说"404 请求有问题"，
+#   人根本不知道是自己配置错位了。所以把提示写进代码，再用测试钉住它。
+#
+#   另外这也验证了错误分级：404 属于 FatalError（重试没用），不是 RetryableError。
+# ------------------------------------------------------------
+def test_chat_404_报错提示要指明该检查配置(monkeypatch):
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return FakeResponse(404, text='{"error":{"code":"model_not_found"}}')
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+
+    with pytest.raises(FatalError) as exc_info:
+        make_client().chat("系统提示", "用户提示")
+
+    # str(e) 拿到异常对象的文字说明；要提醒用户去查这两个变量
+    message = str(exc_info.value)
+    assert "API_BASE_URL" in message
+    assert "MODEL_NAME" in message

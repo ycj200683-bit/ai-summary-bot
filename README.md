@@ -1,9 +1,9 @@
 # 大模型文本摘要器（ai-summary-bot）
 
-用 Python 调用 DeepSeek API，把一段长文本压缩成 3 句话以内的中文摘要。命令行工具，支持读取文件、控制摘要长度、失败自动重试、全量调用日志落盘。
+用 Python 调用大模型 API，把一段长文本压缩成 3 句话以内的中文摘要。命令行工具，支持读取文件、控制摘要长度、失败自动重试、全量调用日志落盘，**并且可以只改环境变量就切换到任意 OpenAI 兼容的大模型服务**（DeepSeek / 阿里云百炼 / OpenAI / 本地 Ollama……）。
 
 > 这是一个**从零搭建**的练手项目（不是跟教程抄的），目的是把「大模型应用开发」需要的工程化环节完整走一遍：
-> 依赖管理 → 面向对象设计 → 异常分级 → 装饰器重试 → 单元测试 → 日志落盘 → 版本发布。
+> 依赖管理 → 面向对象设计 → 异常分级 → 装饰器重试 → 单元测试 → 日志落盘 → 多厂商可插拔 → 版本发布。
 
 ---
 
@@ -16,13 +16,15 @@
 | 失败自动重试 | API 超时 / 网络抖动 / 429 限流 / 5xx → 指数退避重试（1s → 2s → 4s） |
 | 错误分级 | 401 / 402 这类不可恢复错误**立即失败**，不做无谓等待 |
 | 调用日志落盘 | 每次运行的关键信息和错误写入 `logs/app.log`，跑批量任务出问题可事后排查 |
+| **多厂商可切换** | 换服务商只改 `API_BASE_URL` / `MODEL_NAME` 两个环境变量，**代码一行不动** |
+| 失败可被脚本感知 | 成功退出码 `0`、失败 `1`，可以直接用在 shell 脚本 / CI 里判断 |
 
 ---
 
 ## 环境要求
 
 - **Python 3.10+**（本项目在 3.14.5 上开发）
-- 一个 **DeepSeek API Key**（<https://platform.deepseek.com/> 注册后在「API keys」页面创建）
+- 任意 **OpenAI 兼容**的大模型服务 API Key。默认走 DeepSeek（<https://platform.deepseek.com/> 注册后在「API keys」页面创建），也可以换成别的，见下方「切换到其他服务商」
 - 依赖库：`requests`；跑测试需要 `pytest`
 
 ---
@@ -44,21 +46,56 @@ pip install -r requirements.txt          # 运行依赖
 pip install -r requirements-dev.txt      # 想跑测试再装这个
 ```
 
-### 配置 API Key
+### 配置（全部通过环境变量）
 
-Key 通过**环境变量**读取，不写进代码，所以不会被提交到仓库。
+配置项都从**环境变量**读取，不写进代码，所以 key 不会被提交到仓库。
+
+| 环境变量 | 是否必填 | 默认值 | 说明 |
+|---|---|---|---|
+| `API_KEY` | **必填** | 无 | 服务商的 API Key。未设置时程序直接退出并提示（不会带着空 key 去白白请求一次） |
+| `API_BASE_URL` | 可选 | `https://api.deepseek.com/v1` | 服务地址。**写 base 或写完整 URL 都行**，代码会自动补 `/chat/completions`，结尾多打的斜杠和空格也会处理掉 |
+| `MODEL_NAME` | 可选 | `deepseek-chat` | 模型名，比如 `deepseek-chat` / `qwen-plus` / `gpt-4o-mini` / `qwen2.5:7b` |
 
 **Windows（PowerShell）**
 ```powershell
-$env:DEEPSEEK_API_KEY = "你的key"
+$env:API_KEY = "你的key"
 ```
 
 **Windows（Git Bash）/ macOS / Linux**
 ```bash
-export DEEPSEEK_API_KEY="你的key"
+export API_KEY="你的key"
 ```
 
 > 每次新开终端都要重设。想永久生效：Windows 搜「编辑系统环境变量」→ 新建用户变量；macOS/Linux 写进 `~/.zshrc`。
+>
+> 兼容旧配置：只设 `DEEPSEEK_API_KEY`（不含 `API_KEY`）也仍然能跑，不会因为升级就报错。
+
+### 切换到其他服务商
+
+只要对方提供 OpenAI 兼容接口，改两个环境变量就能切，**代码一行不用动**：
+
+```powershell
+# 例：阿里云百炼
+$env:API_KEY      = "sk-百炼的key"
+$env:API_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+$env:MODEL_NAME   = "qwen-plus"
+
+# 例：本地 Ollama（不用 key，随便填一个非空值即可）
+$env:API_KEY      = "ollama"
+$env:API_BASE_URL = "http://localhost:11434/v1"
+$env:MODEL_NAME   = "qwen2.5:7b"
+
+# 例：OpenAI 官方
+$env:API_KEY      = "sk-..."
+$env:API_BASE_URL = "https://api.openai.com/v1"
+$env:MODEL_NAME   = "gpt-4o-mini"
+```
+
+改完直接跑，日志第一行会告诉你当前实际连到哪去了：
+
+```
+14:52:14 | INFO    | 🤖 模型：qwen-plus ｜ 端点：https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+```
 
 ---
 
@@ -83,19 +120,23 @@ python main.py --file sample.txt
 ```
 
 ```
-14:46:27 | INFO    | 📄 已读取文件：sample.txt（359 字）
+14:52:14 | INFO    | 📄 已读取文件：sample.txt（359 字）
+14:52:14 | INFO    | 🤖 模型：qwen-plus ｜ 端点：https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
 
 --- 摘要结果 ---
 
 人工智能正深刻改变软件开发与产品设计流程：开发者可用自然语言生成代码初稿，
 产品经理可快速产出调研问卷、分析反馈和竞品框架，大幅提升效率。
-但 AI 生成内容存在缺陷风险与理解局限，需更严格的评审和人工把关。
-当前 AI 本质是"增强工具"，其价值高度依赖人的专业判断、问题定义能力和业务
-洞察力，无法替代经验丰富的从业者。
+但 AI 生成内容存在缺陷风险与业务理解局限，需更严格的人工评审；
+其本质是辅助工具，无法替代人的专业判断与业务洞察。
+核心价值不在于替代人力，而在于将人从重复劳动中解放，聚焦于更高阶的决策
+——"做什么"和"为什么做"。
 ```
 
-> 第一行是 `logging` 输出（自动带时间戳，同时落盘到 `logs/app.log`），
+> 前两行是 `logging` 输出（自动带时间戳，同时落盘到 `logs/app.log`），
 > 后面是 `print` 输出。**判据**：给开发者看的记录走 logging，给用户看的结果走 print。
+>
+> 上面这次运行恰好是用**百炼 qwen-plus** 跑的——同一份代码，只换了环境变量。
 
 ### 示例 2：自定义摘要句数
 
@@ -113,15 +154,38 @@ python main.py --file sample.txt --length 5
 
 ```
 14:22:05 | INFO    | 📄 已读取文件：sample.txt（359 字）
+14:22:05 | INFO    | 🤖 模型：deepseek-chat ｜ 端点：https://api.deepseek.com/v1/chat/completions
 14:22:06 | ERROR   | ❌ 401/403 key 不对或没权限，别重试，去检查 key
 ```
 
 可恢复错误（429 限流 / 超时 / 5xx）——自动重试，过程也记进日志：
 
 ```
+14:23:09 | INFO    | 🤖 模型：deepseek-chat ｜ 端点：https://api.deepseek.com/v1/chat/completions
 14:23:10 | WARNING | 🔁 第 1 次失败（429 被限流了，等一会儿可以重试），1 秒后重试……
 14:23:13 | WARNING | 🔁 第 2 次失败（429 被限流了，等一会儿可以重试），2 秒后重试……
 ```
+
+换厂商时最容易踩的坑：**只改了端点，忘了改模型名**（这是真实跑出来的输出）：
+
+```
+14:54:26 | INFO    | 🤖 模型：deepseek-chat ｜ 端点：https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+14:54:26 | ERROR   | ❌ 404 找不到接口或模型。若刚换过厂商，请检查 API_BASE_URL 和 MODEL_NAME 是否配套改了。
+                     服务端原文：{"error":{"message":"The model `deepseek-chat` does not exist...","code":"model_not_found"}}
+```
+
+> 看出来了吗——报错上方那行日志已经把「当前模型是 `deepseek-chat`、端点却是百炼」摊在眼前了，配置错位一眼可见。这也是为什么要专门打那行启动日志。
+
+连 key 都没设时——连请求都不会发出去：
+
+```
+❌ 没找到环境变量 API_KEY（旧名 DEEPSEEK_API_KEY 也认）。请先设置：
+   PowerShell: $env:API_KEY="你的key"
+   Git Bash  : export API_KEY="你的key"
+   可选：$env:API_BASE_URL / $env:MODEL_NAME 换厂商
+```
+
+**退出码**：成功 `0`，失败 `1`（包括没设 key 的情况）。所以在脚本或 CI 里可以直接用退出码判断，不必去 grep 输出文本。
 
 ---
 
@@ -130,20 +194,24 @@ python main.py --file sample.txt --length 5
 测试**不会真的调用 API**（不花钱、不联网、结果稳定）：用 `monkeypatch` 把 `requests.post` 换成假函数，人为造出 200 / 401 / 429 各种响应。
 
 ```bash
-python -m pytest -v
+python -m pytest -q        # 想看每条用例的名字，加 -v
 ```
 
 预期输出：
 
 ```
-tests/test_main.py::test_build_prompt_把句数写进系统提示词 PASSED    [ 25%]
-tests/test_main.py::test_chat_正常返回                      PASSED    [ 50%]
-tests/test_main.py::test_chat_401_不重试                    PASSED    [ 75%]
-tests/test_main.py::test_chat_429_重试后成功                PASSED    [100%]
-========================= 4 passed in 0.12s =========================
+tests\test_main.py ...............                                        [100%]
+
+============================= 15 passed in 0.11s ==============================
 ```
 
-4 个用例分别覆盖：提示词拼装、正常返回、不可恢复错误不重试、可恢复错误重试成功（含指数退避验证）。
+15 条用例分三类：
+
+| 类别 | 覆盖内容 |
+|---|---|
+| 提示词拼装 | `--length` 是否真的写进了系统提示词 |
+| 网络行为 | 正常返回；401 立即失败且**只请求 1 次**；429 重试成功后共请求 3 次（并断言退避时长为 `[1.0, 2.0]`）；404 的报错信息必须提示去检查配置 |
+| 配置解析 | URL 归一化 5 种输入、默认值、新旧变量名优先级、空字符串回退、缺 key 直接退出 |
 
 > ⚠️ 测试文件只能用 `pytest` 跑，**不要用编辑器右上角的 ▶ 运行**——那是「当脚本执行」，`sys.path` 里只有 `tests/`，会报 `ModuleNotFoundError: No module named 'main'`。
 
@@ -161,7 +229,7 @@ ai-summary-bot/
 ├── pyrightconfig.json       # 类型检查配置（让 IDE 认识 import main）
 ├── conftest.py              # 把项目根加进 sys.path
 ├── tests/
-│   ├── test_main.py         # 4 个单元测试
+│   ├── test_main.py         # 14 个单元测试
 │   └── README.md            # 测试写法讲解
 ├── learn_oop.py             # 学习笔记：OOP 对照示例
 ├── learn_decorator.py       # 学习笔记：闭包与装饰器 6 步对照示例
@@ -203,11 +271,40 @@ ai-summary-bot/
 
 Windows 上 `FileHandler` 默认用系统编码（GBK）写文件，中文日志会乱码，甚至直接抛 `UnicodeEncodeError`。这是 Windows 上的经典坑。
 
+**6. 怎么做到"换厂商不用改代码"？**
+
+调用大模型本质上只有三件事：**发给谁**（base_url）、**用哪个模型**（model）、**拿什么钥匙**（key）。这三样全部通过环境变量注入，代码里只留下"协议"这一层抽象——也就是 OpenAI 兼容协议。于是：
+
+```python
+# 业务代码完全不知道 DeepSeek 的存在，只知道"有一个 OpenAI 兼容端点"
+return cls(api_key=key, api_url=normalize_api_url(base_url), model=model)
+```
+
+这就是依赖倒置最朴素的样子：**依赖抽象（协议），而不是依赖具体实现（某家公司）**。带来三个实际好处：
+
+1. 切厂商 = 改环境变量，出问题的排查范围缩小到"配置"而不是"代码"
+2. 本地能用 Ollama 跑（`http://localhost:11434/v1`），不联网、不花钱地做冒烟测试
+3. 某个服务商挂了/涨价了，切走只要几秒钟
+
+配置解析本身也做了防御：用户填的地址可能是 `https://api.deepseek.com/v1`（要补路径）、也可能是完整 URL（不能重复补）、还可能带着多余斜杠或空格。`normalize_api_url()` 把这些差异都消化在**边界**上，让 `chat()` 里的 `requests.post()` 永远只拿到干净输入。空字符串也做了回退——因为 Windows 上 `$env:X=""` 恰好会留下一个"存在但为空"的变量，`os.getenv("X", 默认值)` 在这里会失效，必须用 `os.getenv("X") or 默认值`。这类边界情况正是配置代码最容易翻车的地方，所以专门为它写了 10 条测试。
+
+**7. 为什么"失败"也要设计？**
+
+这是真正动手跑才暴露出来的问题，光看代码看不出来：
+
+- **退出码**：原来无论成功失败都返回 `0`。人看屏幕知道挂了，但脚本和 CI 不知道——批量跑 100 个文件的摘要，最后"全部成功"的假象会一路骗到部署。改成失败时 `raise SystemExit(1)`，成功才 `0`。**能被机器识别的失败，才算真的失败。**
+- **报错要说人话**：只换端点忘了换模型名，服务端回一句 `model_not_found`，原来的代码原样转发，用户得自己去猜。现在 404 单独处理，直接把两行的 `API_BASE_URL` 和 `MODEL_NAME` 写进提示；再加上启动时那行 `🤖 模型：... ｜ 端点：...`，配置错位一眼可见。
+
+顺带还修了个小瑕疵：原来「--- 摘要结果 ---」这个标题在**发请求之前**就打出来了，一失败就会出现"有标题没内容"的尴尬画面。现在改成先拿到结果、成功了再打印标题和正文——**顺序正确了，也就不会留下半截输出。**
+
 ---
 
 ## 已知限制 / 后续计划
 
+- [x] ~~只支持 DeepSeek 一家~~ → v0.5 已支持任意 OpenAI 兼容服务
+- [ ] 不校验 `API_KEY` 的长度/格式，填错了要靠 API 返回 401 才发现
 - [ ] 目前只支持单文件；计划支持批量处理 CSV（每行一次摘要）→ **v1.1**
+- [ ] 主流程没有 `--model` 命令行参数，换模型得改环境变量（README 里写了怎么换）
 - [ ] 调用记录只落日志文件，尚未入库；计划落 MySQL 以便统计（成功率、平均耗时、token 消耗）→ **v1.3**
 - [ ] 只有一套 prompt；计划做两套方案对比评测并产出数据报告 → **v2.1**
 - [ ] 尚无 Web 界面
@@ -224,7 +321,10 @@ Windows 上 `FileHandler` 默认用系统编码（GBK）写文件，中文日志
 | v0.2 | 按职责拆成 `Config` / `LLMClient` / `Summarizer` 三个类，异常分级 |
 | v0.3 | 新增 `@retry` 装饰器，指数退避 + 只重试可恢复错误 |
 | v0.4 | `print` 改造为 `logging`，日志落盘 `logs/app.log` |
-| **v1.0** | 补 pytest 单元测试 4 例，README 完整化，打 tag 发布 |
+| v0.5 | 配置全部环境变量化，支持任意 OpenAI 兼容服务（DeepSeek / 百炼 / OpenAI / 本地 Ollama）；配置解析加 10 条测试；修掉实测暴露的 3 个问题（失败退出码、404 提示、成功才打印标题） |
+| **v1.0** | 补 pytest 单元测试，README 完整化，打 tag 发布 |
+
+> 提交粒度：一个功能一个分支（`feature/xxx`），完成后用 `--no-ff` 合并回 `main`，保留完整的合并记录。
 
 ---
 
