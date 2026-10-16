@@ -1,6 +1,26 @@
 """
-项目①：大模型文本摘要器 v0.4（W8 日志版）
+项目①：大模型文本摘要器 v0.5（多厂商可切换版）
 作者：俊 ｜ 方向：B（大模型应用 / AI 产品）
+
+v0.5 变化：
+  把"连哪家厂商"从代码里搬到了环境变量里，一套代码通吃所有 OpenAI 兼容服务：
+    API_KEY       密钥（兼容旧的 DEEPSEEK_API_KEY）
+    API_BASE_URL  服务地址，写 base 或写完整 URL 都行：
+                     https://api.deepseek.com/v1                    → 自动补 /chat/completions
+                     https://dashscope.aliyuncs.com/compatible-mode/v1
+                     http://localhost:11434/v1                      （本地 Ollama）
+    MODEL_NAME    模型名，如 deepseek-chat / qwen-plus / qwen2.5:7b
+
+  为什么这件事值得做：调用大模型本质就三件事——发给谁、用哪个模型、拿什么钥匙。
+  把这三个变量化之后，切换厂商 = 改环境变量，业务代码一行都不用动。
+  这也是"依赖倒置"最朴素的样子：代码依赖"OpenAI 兼容协议"这个抽象，
+  而不是依赖"DeepSeek 这家公司"。
+
+  顺带修掉三个真实跑出来的小毛病（都是实测才暴露的，光看代码看不出来）：
+    ① 启动时打一行日志，说明当前连的是哪个模型、哪个端点
+    ② 404 单独加提示：换厂商时只改端点忘了改模型名，是最容易踩的坑
+    ③ 失败时退出码改成 1（以前失败也返回 0，脚本和 CI 根本发现不了失败），
+       并且把"显示结果"挪到请求成功之后，失败时不会留下一个空标题
 
 v0.4 变化（W8）：
   引入 logging，替代散落的 print。判断标准只有一条：
@@ -22,8 +42,15 @@ v0.2 变化：
   把散落的函数按职责包成 3 个类：Config / LLMClient / Summarizer。
 
 用法：
+  # 先设三个环境变量（以 DeepSeek 为例）
+  #   PowerShell: $env:API_KEY="sk-xxx"
+  #   Git Bash  : export API_KEY="sk-xxx"
   python main.py --file sample.txt
   python main.py --file sample.txt --length 5   # 指定摘要句数
+
+  # 换厂商？只改环境变量，代码不动（例：阿里云百炼）
+  #   $env:API_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+  #   $env:MODEL_NAME="qwen-plus"
 
 依赖：requests
 """
@@ -56,13 +83,52 @@ logger = logging.getLogger(__name__)
 #    @dataclass 的作用：帮你自动生成 __init__，
 #    不用手写 def __init__(self, api_key, model, ...): self.api_key = api_key ...
 # ============================================================
+
+# ↓ 默认值提成模块级常量，好处有二：
+#   ① Config 和 from_env() 引用的是同一个来源，改一处就都改（不会两边打架）
+#   ② 名字自带说明，读代码的人一眼知道现状是"默认走 DeepSeek"
+DEFAULT_API_URL = "https://api.deepseek.com/v1/chat/completions"
+DEFAULT_MODEL = "deepseek-chat"
+
+# 环境变量名也提成常量：拼错变量名是最常见的低级 bug，写成常量至少能被 IDE 补全
+ENV_API_KEY = "API_KEY"
+ENV_API_BASE_URL = "API_BASE_URL"
+ENV_MODEL_NAME = "MODEL_NAME"
+
+# 旧的变量名继续认，避免老用户（其实就是你自己）改配置时炸掉
+LEGACY_ENV_API_KEY = "DEEPSEEK_API_KEY"
+
+# 各家 OpenAI 兼容服务的"对话补全"路径，全都长这样
+CHAT_COMPLETIONS_PATH = "/chat/completions"
+
+
+def normalize_api_url(raw: str) -> str:
+    """
+    把用户填的地址统一成"能直接 POST 的完整 URL"。
+
+    为什么要容错：不同厂商文档里给的东西不一样——
+      DeepSeek 文档给 https://api.deepseek.com      （要自己拼 /chat/completions）
+      百炼     给 https://dashscope.aliyuncs.com/compatible-mode/v1
+      OpenAI   给 https://api.openai.com/v1
+    让人记住"到底要不要带 /chat/completions"是反人类的，
+    所以这里统一处理：带了就不重复拼，没带就补上，尾斜杠一律去掉。
+
+    这就是"防御式解析"：把恶心留在边界（配置入口），
+    让核心逻辑（chat 里的 requests.post）永远拿到干净的输入。
+    """
+    url = raw.strip().rstrip("/")                  # 去掉手滑打出的空格和结尾斜杠
+    if url.endswith(CHAT_COMPLETIONS_PATH):
+        return url                                 # 已经是完整 URL，原样用
+    return url + CHAT_COMPLETIONS_PATH             # 只给了 base，补上路径
+
+
 @dataclass
 class Config:
     """所有可调整的参数集中放在这里。"""
 
     api_key: str                                  # 从环境变量读进来的密钥
-    api_url: str = "https://api.deepseek.com/v1/chat/completions"
-    model: str = "deepseek-chat"
+    api_url: str = DEFAULT_API_URL
+    model: str = DEFAULT_MODEL
     temperature: float = 0.3                      # 越小越稳定、越大越发散
     timeout: int = 30                             # 超时秒数
 
@@ -72,16 +138,34 @@ class Config:
         从环境变量创建 Config。
         注意：这是"类方法"（@classmethod），第一个参数是 cls（类本身），不是 self。
         用法：Config.from_env()  —— 不需要先造对象就能调。
+
+        读三个变量（都可以不设，不设就用 DeepSeek 的默认值）：
+          API_KEY        必须设，否则直接退出
+          API_BASE_URL   不设 → DeepSeek；设了 → 按 normalize_api_url 处理
+          MODEL_NAME     不设 → deepseek-chat
         """
-        key = os.getenv("DEEPSEEK_API_KEY")
+        # "or" 链的写法：前者为空（None 或空字符串）就取后者。
+        # 比 os.getenv("API_KEY", os.getenv("DEEPSEEK_API_KEY")) 好在：
+        # 环境变量设成空字符串时也能正确回退（那种情况很少有人想到，但确实会出 bug）
+        key = os.getenv(ENV_API_KEY) or os.getenv(LEGACY_ENV_API_KEY)
         if not key:
             raise SystemExit(
-                "❌ 没找到环境变量 DEEPSEEK_API_KEY。请先设置：\n"
-                "   Git Bash :  export DEEPSEEK_API_KEY=\"你的key\"\n"
-                "   PowerShell: $env:DEEPSEEK_API_KEY=\"你的key\""
+                f"❌ 没找到环境变量 {ENV_API_KEY}（旧名 {LEGACY_ENV_API_KEY} 也认）。请先设置：\n"
+                f'   PowerShell: $env:{ENV_API_KEY}="你的key"\n'
+                f'   Git Bash  : export {ENV_API_KEY}="你的key"\n'
+                f"   可选：$env:{ENV_API_BASE_URL} / $env:{ENV_MODEL_NAME} 换厂商"
             )
-        # cls(...) 等价于 Config(api_key=key)，其余用上面写的默认值
-        return cls(api_key=key)
+
+        # 同样用 "or" 兜底：环境变量没设（None）或设成空串时，都退回默认值
+        base_url = os.getenv(ENV_API_BASE_URL) or DEFAULT_API_URL
+        model = os.getenv(ENV_MODEL_NAME) or DEFAULT_MODEL
+
+        # cls(...) 等价于 Config(...)，没传的参数用上面写的默认值
+        return cls(
+            api_key=key,
+            api_url=normalize_api_url(base_url),
+            model=model,
+        )
 
 
 # ============================================================
@@ -195,6 +279,15 @@ class LLMClient:
             raise FatalError("402 余额不足，去充值")
         if resp.status_code >= 500:
             raise RetryableError(f"{resp.status_code} 服务端出错，可以重试")
+        # ★v0.5 改动②：404 单独拎出来加提示。这不是洁癖，是我自己踩过的坑——
+        #   换了 API_BASE_URL 却忘了改 MODEL_NAME，就会拿着 deepseek-chat 去问百炼，
+        #   对方回一个干巴巴的 model_not_found，人得愣半天才知道是自己的配置错位了。
+        #   报错信息里直接写上"该去检查哪两个变量"，省掉一次排障。
+        if resp.status_code == 404:
+            raise FatalError(
+                f"404 找不到接口或模型。若刚换过厂商，请检查 {ENV_API_BASE_URL} 和 "
+                f"{ENV_MODEL_NAME} 是否配套改了。服务端原文：{resp.text[:200]}"
+            )
         if resp.status_code >= 400:
             raise FatalError(f"{resp.status_code} 请求有问题：{resp.text[:200]}")
 
@@ -264,19 +357,35 @@ def main():
     client = LLMClient(config)
     bot = Summarizer(client, max_sentences=args.length)
 
+    # ★v0.5 改动①：把"连哪家、用什么模型"打出来。
+    #   为什么值得记：切厂商之后如果结果不对，第一件事就是确认"到底连到哪去了"。
+    #   ⚠ 只打 model 和 url，绝对不要打 api_key —— 日志文件是会被提交/分享出去的
+    logger.info("🤖 模型：%s ｜ 端点：%s", config.model, config.api_url)
+
     # 3. 调用 + 兜住异常
+    #
+    #   ★v0.5 改动③：把"发请求"和"显示结果"拆开，并把失败变成非 0 退出码。
+    #
+    #   旧写法是先把 "--- 摘要结果 ---" 打出来（print 在 try 里、且排在调用之前），
+    #   结果请求一失败，用户就看到一个孤零零的标题底下什么都没有 —— 很懵。
+    #   现在改成：先把结果拿到手，成功了才打印标题和正文。
+    #   顺序清楚了，也顺手得到一个好处：失败时不会有半截输出。
     try:
-        # ↓ 这两行是【给用户的最终输出】，必须保留 print！
-        #   ⚠ 尤其 print(bot.summarize(text)) —— 改成 logger 用户就看不到摘要了
-        print("\n--- 摘要结果 ---\n")
-        print(bot.summarize(text))
+        result = bot.summarize(text)
     except RetryableError as e:
         # ★W8 改动④：真正的失败，等级最高 → error
         logger.error("🔁 重试 3 次后仍然失败：%s", e)
         print("   常见原因：网络不稳 / 429 被限流 / 服务端 5xx，稍后再试。")   # 给用户的提示 → 保留
+        raise SystemExit(1)
     except FatalError as e:
         # ★W8 改动⑤：key 错 / 余额不足这类不可恢复错误 → error
         logger.error("❌ %s", e)
+        raise SystemExit(1)
+
+    # 走到这里说明成功了，再打印【给用户看的最终输出】
+    #   ⚠ 必须用 print 而不是 logger：改成 logger 用户就看不到摘要了
+    print("\n--- 摘要结果 ---\n")
+    print(result)
 
 
 if __name__ == "__main__":
