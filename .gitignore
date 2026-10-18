@@ -7,3 +7,7 @@ venv/
 .vscode/
 *.log
 logs/
+
+# 语料正文来自第三方媒体，有版权，不进公开仓库（本地保留即可）
+corpus/*.txt
+corpus/index.tsv
