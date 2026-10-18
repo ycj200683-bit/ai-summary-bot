@@ -11,3 +11,7 @@ logs/
 # 语料正文来自第三方媒体，有版权，不进公开仓库（本地保留即可）
 corpus/*.txt
 corpus/index.tsv
+
+# 由 corpus 生成的表格，内容和语料相同，同理不入库
+data.csv
+out.csv
