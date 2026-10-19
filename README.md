@@ -46,29 +46,39 @@ pip install -r requirements.txt          # 运行依赖
 pip install -r requirements-dev.txt      # 想跑测试再装这个
 ```
 
-### 配置（全部通过环境变量）
+### 配置（写在 `.env` 里，或直接用环境变量）
 
-配置项都从**环境变量**读取，不写进代码，所以 key 不会被提交到仓库。
+配置项**不写进代码**，所以 key 不会被提交到仓库。两种给法，任选一种：
+
+**① 推荐：写进项目根目录的 `.env`**（已在 `.gitignore` 里，推不上仓库）
+
+```ini
+API_KEY=你的key
+API_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+MODEL_NAME=deepseek-v4.1-flash
+```
+
+`python main.py`、`python -m uvicorn app:app` 都会自己读它，不用每次开终端都 export 一遍。
+
+**② 或者直接用环境变量**（优先级更高，相同名字时以环境变量为准）
+
+```powershell
+# Windows（PowerShell）
+$env:API_KEY = "你的key"
+
+# Windows（Git Bash）/ macOS / Linux
+export API_KEY="你的key"
+```
 
 | 环境变量 | 是否必填 | 默认值 | 说明 |
 |---|---|---|---|
 | `API_KEY` | **必填** | 无 | 服务商的 API Key。未设置时程序直接退出并提示（不会带着空 key 去白白请求一次） |
 | `API_BASE_URL` | 可选 | `https://api.deepseek.com/v1` | 服务地址。**写 base 或写完整 URL 都行**，代码会自动补 `/chat/completions`，结尾多打的斜杠和空格也会处理掉 |
-| `MODEL_NAME` | 可选 | `deepseek-chat` | 模型名，比如 `deepseek-chat` / `qwen-plus` / `gpt-4o-mini` / `qwen2.5:7b` |
+| `MODEL_NAME` | 可选 | `deepseek-chat` | 模型名。本项目当前用 `deepseek-v4.1-flash`（走百炼）；也可填 `deepseek-chat` / `qwen-plus` / `gpt-4o-mini` / `qwen2.5:7b` 等 |
 
-**Windows（PowerShell）**
-```powershell
-$env:API_KEY = "你的key"
-```
-
-**Windows（Git Bash）/ macOS / Linux**
-```bash
-export API_KEY="你的key"
-```
-
-> 每次新开终端都要重设。想永久生效：Windows 搜「编辑系统环境变量」→ 新建用户变量；macOS/Linux 写进 `~/.zshrc`。
->
 > 兼容旧配置：只设 `DEEPSEEK_API_KEY`（不含 `API_KEY`）也仍然能跑，不会因为升级就报错。
+>
+> `.env` 里能写的东西只有三样，别塞注释以外的花活：一行一个 `KEY=VALUE`，`#` 开头的行会被跳过，值两端的引号会自动剥掉。
 
 ### 切换到其他服务商
 
@@ -221,7 +231,7 @@ curl -X POST http://127.0.0.1:8000/api/summarize \
   "summary": "……",
   "latency_ms": 1988,
   "input_chars": 127,
-  "model": "qwen-plus"
+  "model": "deepseek-v4.1-flash"
 }
 ```
 

@@ -93,6 +93,37 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def load_dotenv(path: str = ".env") -> None:
+    """
+    极简 .env 读取（30 行手写，不引 python-dotenv）。
+
+    规则三条：
+      ① 一行一个 KEY=VALUE；空行和 # 开头的行跳过
+      ② 已经存在的环境变量不覆盖（setdefault）——真实环境变量优先级高于文件
+      ③ 值两端的引号剥掉
+
+    ★ 为什么放在 main.py 而不是 app.py：
+      同一个 .env 既要在命令行用，也要在 Web 服务用。
+      放在这里，`python main.py` 和 `uvicorn app:app` 读的是同一份配置，
+      换模型只改一个地方，不会出现"网页换了、命令行还是老模型"。
+    ★ 为什么不放在模块顶层执行：
+      测试里要验证"没配 key 时的报错"，模块导入时就偷偷塞进去一个 key
+      会让那类测试失效。所以只在 main() 里显式调用。
+    ★ 为什么不把 key 直接写进代码：
+      .env 在 .gitignore 里，推不上仓库；硬编码则一推就公开了。
+      密钥只放环境变量或 .env，这是底线，不是风格问题。
+    """
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
 # ============================================================
 # 1) Config：只用来"装配置"的类
 #    @dataclass 的作用：帮你自动生成 __init__，
@@ -394,6 +425,10 @@ def run_batch(args) -> None:
 
 
 def main():
+    # 先读 .env：这样 `python main.py --file x.txt` 不用每次手动 export 三行环境变量。
+    # 真实环境变量优先级更高（load_dotenv 用 setdefault），服务器上覆盖也照样生效。
+    load_dotenv()
+
     parser = argparse.ArgumentParser(description="大模型文本摘要器")
     parser.add_argument("--length", type=int, default=3, help="摘要句数，默认 3")
 

@@ -36,34 +36,12 @@ from pydantic import BaseModel, Field
 
 from main import Config, FatalError, LLMClient, RetryableError, Summarizer
 from main import DEFAULT_MODEL, ENV_MODEL_NAME
+from main import load_dotenv
 
 
-def _load_dotenv(path: str = ".env") -> None:
-    """
-    极简 .env 读取（不引入 python-dotenv 这种额外依赖）。
-
-    规则只有三条：
-      ① 一行一个 KEY=VALUE；空行和 # 开头的行跳过
-      ② 已经存在的环境变量不覆盖（setdefault）——真实环境变量优先级高于文件
-      ③ 值两端的引号剥掉
-
-    ★ 为什么不把 key 写死在代码里：
-      .env 已经在 .gitignore 里，进不了仓库；代码里硬编码则一推就公开了。
-      密钥只放环境变量或 .env，这是底线，不是风格问题。
-    """
-    if not os.path.exists(path):
-        return
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-# 必须在任何 Config.from_env() 之前执行
-_load_dotenv()
+# 必须在任何 Config.from_env() 之前执行。
+# 这里直接复用 main.py 里的实现：CLI 和 Web 服务读同一份 .env，不各写一份。
+load_dotenv()
 
 
 # ============================================================
