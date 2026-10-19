@@ -373,8 +373,19 @@ def run_batch(args) -> None:
     df = batch.load_input(args.input, args.text_col, args.limit)
     logger.info("📄 读入 %s 行，正文列 = %s", len(df), args.text_col)
 
+    # 2.5 ★W10：--resume 时先翻出上次的结果，挑出已经成功/跳过的行
+    #   注意这里读的是 --output 指向的那个文件，所以"上次跑的是谁"由 --output 决定。
+    #   换一个 --output 就等于换了一条进度线——这正是我们想要的：互不干扰。
+    done = batch.load_done(args.output) if args.resume else {}
+    if args.resume and not done:
+        logger.info("♻️  --resume 已开，但 %s 里没有可复用的结果，这次从头跑", args.output)
+    elif done:
+        remaining = sum(1 for one in df["id"].astype(str) if str(one) not in done)
+        logger.info("♻️  复用 %s 行旧结果，本次只需处理 %s 行", len(done), remaining)
+
     # 3. 逐行摘要（batch.py 里的核心循环）
-    df = batch.summarize_rows(bot, df, args.text_col)
+    #   out_path 传下去 = 允许边跑边落盘；done 传下去 = 允许命中就跳过。
+    df = batch.summarize_rows(bot, df, args.text_col, out_path=args.output, done=done)
 
     # 4. 写新表 + 汇总
     batch.save_output(df, args.output)
@@ -401,6 +412,13 @@ def main():
                         help="批量模式：结果写到哪个 CSV，默认 out.csv")
     parser.add_argument("--limit", type=int, default=None,
                         help="批量模式：只处理前 N 行（调试用，省钱）")
+
+    # ★W10：action="store_true" 表示这是个【开关】——写了 --resume 就是 True，
+    #   不写就是 False，不用跟值（不能写 --resume True）。
+    #   凡是"要/不要"这类开关，都用 store_true，别用 type=bool ——
+    #   type=bool 会把字符串 "False" 也当成 True，是个经典坑。
+    parser.add_argument("--resume", action="store_true",
+                        help="批量模式：接着上次的 --output 跑，跳过已经成功的行")
 
     args = parser.parse_args()
 
