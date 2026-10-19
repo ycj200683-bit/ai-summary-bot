@@ -1,6 +1,6 @@
 # 大模型文本摘要器（ai-summary-bot）
 
-用 Python 调用大模型 API，把一段长文本压缩成 3 句话以内的中文摘要。命令行工具，支持读取文件、控制摘要长度、失败自动重试、全量调用日志落盘，**并且可以只改环境变量就切换到任意 OpenAI 兼容的大模型服务**（DeepSeek / 阿里云百炼 / OpenAI / 本地 Ollama……）。
+用 Python 调用大模型 API，把长文本压缩成 3 句话以内的中文摘要。既是**命令行工具**（读文件、控制长度、失败自动重试、日志落盘、只改环境变量即可切换任意 OpenAI 兼容的大模型服务），也是**可对外的 Web 服务**（FastAPI + 单页前端 + 接口文档），另有**批量模式**（CSV 逐行摘要、逐行容错、断点续跑）。
 
 > 这是一个**从零搭建**的练手项目（不是跟教程抄的），目的是把「大模型应用开发」需要的工程化环节完整走一遍：
 > 依赖管理 → 面向对象设计 → 异常分级 → 装饰器重试 → 单元测试 → 日志落盘 → 多厂商可插拔 → 版本发布。
@@ -189,6 +189,53 @@ python main.py --file sample.txt --length 5
 
 ---
 
+## Web 服务（FastAPI）
+
+命令行之外，同一套摘要能力也通过 HTTP 暴露出来了，别人不用装 Python 就能用。
+
+```bash
+python -m uvicorn app:app --reload --port 8000
+```
+
+打开 <http://127.0.0.1:8000> 是网页界面，<http://127.0.0.1:8000/docs> 是自动生成的 API 文档（Swagger UI，可以直接在页面上试接口）。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/` | 网页界面（单文件 HTML，不依赖 CDN） |
+| `GET` | `/api/health` | 健康检查：返回模型名、是否已配置、限额 |
+| `POST` | `/api/summarize` | 单条摘要 |
+
+请求示例：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/summarize \
+  -H "Content-Type: application/json" \
+  -d '{"text": "要摘要的正文……", "length": 3}'
+```
+
+```json
+{
+  "summary": "……",
+  "latency_ms": 1988,
+  "input_chars": 127,
+  "model": "qwen-plus"
+}
+```
+
+### 这一层的三个设计决定
+
+| 决定 | 原因 |
+|---|---|
+| **不用 `Config.from_env()` 直接初始化** | 它在没配 key 时会 `raise SystemExit`。命令行里这是"程序退出"，在服务里会把整个进程带崩。改成惰性创建 + 返回 503，服务能启动、能说清原因 |
+| **每个 IP 每天 20 次** | 公开部署后，背后是真金白银的 API 账单。不限流的话，一个脚本就能把额度刷光 |
+| **Pydantic 做入参校验** | `text` 限 1~5000 字、`length` 限 1~5，超了自动返回 422，不用自己写 if |
+
+> 注意：限流用的是进程内存，重启即清零。生产环境应该放 Redis——这是下一阶段的事。
+
+---
+
 ## 运行测试
 
 测试**不会真的调用 API**（不花钱、不联网、结果稳定）：用 `monkeypatch` 把 `requests.post` 换成假函数，人为造出 200 / 401 / 429 各种响应。
@@ -222,6 +269,9 @@ tests\test_main.py ...............                                        [100%]
 ```
 ai-summary-bot/
 ├── main.py                  # 主程序：Config / LLMClient / Summarizer 三个类
+├── batch.py                 # 批量模式：读表 → 逐行摘要 → 断点续跑 → 写表
+├── app.py                   # Web 服务：FastAPI 外壳 + 单页前端
+├── build_corpus.py          # 数据准备：corpus/*.txt → data.csv
 ├── sample.txt               # 示例文本
 ├── requirements.txt         # 运行依赖
 ├── requirements-dev.txt     # 开发依赖（pytest）
@@ -229,8 +279,9 @@ ai-summary-bot/
 ├── pyrightconfig.json       # 类型检查配置（让 IDE 认识 import main）
 ├── conftest.py              # 把项目根加进 sys.path
 ├── tests/
-│   ├── test_main.py         # 14 个单元测试
+│   ├── test_main.py         # 15 个单元测试
 │   └── README.md            # 测试写法讲解
+├── corpus/                  # 语料正文（有版权，已 gitignore）
 ├── learn_oop.py             # 学习笔记：OOP 对照示例
 ├── learn_decorator.py       # 学习笔记：闭包与装饰器 6 步对照示例
 └── logs/                    # 运行日志（已 gitignore，不入库）

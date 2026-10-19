@@ -15,3 +15,8 @@ corpus/index.tsv
 # 由 corpus 生成的表格，内容和语料相同，同理不入库
 data.csv
 out.csv
+
+# Web 服务启动脚本与截图产物
+get-pip.py
+_page.png
+page.html
