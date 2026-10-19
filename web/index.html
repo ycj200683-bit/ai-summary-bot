@@ -445,24 +445,6 @@ $("go").addEventListener("click", doSummarize);
 if (initCloud()) {
   refreshStats();
 }
-
-/* 临时自检钩子（验证完就删）
- *   ?selftest=1      测「我的 Key」链路
- *   ?selftest=cloud  测「云服务」链路
- */
-if (location.search.indexOf("selftest=") !== -1) {
-  const which = location.search.indexOf("selftest=cloud") !== -1 ? "cloud" : "own";
-  $("engine").value = which;
-  $("text").value = "青海大学位于西宁，是一所综合性大学。学校海拔较高，气候干燥，冬季寒冷。学校设有多个学院，计算机技术与应用学院是其中之一，注重实践能力培养。";
-  doSummarize().then(function () {
-    const d = document.createElement("div");
-    d.id = "selftest-result";
-    d.textContent = "RESULT|engine=" + which + "|" + $("status").textContent + "|" +
-      $("body").textContent.replace(/\s+/g, " ").slice(0, 160) + "|" +
-      $("latency").textContent + "|" + $("model").textContent + "|total=" + $("s-total").textContent;
-    document.body.appendChild(d);
-  });
-}
 </script>
 </body>
 </html>
