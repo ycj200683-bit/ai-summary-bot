@@ -1,6 +1,21 @@
 """
-项目①：大模型文本摘要器 v0.5（多厂商可切换版）
+项目①：大模型文本摘要器 v1.1（批量模式）
 作者：俊 ｜ 方向：B（大模型应用 / AI 产品）
+
+v1.1 变化（M3 / W9）：
+  新增批量模式，一条命令处理整张 CSV：
+      python main.py --input data.csv --text-col content --output out.csv
+      python main.py --input data.csv --text-col content --output out.csv --limit 5
+
+  分工：
+      main.py  负责组装（读配置 → 造 bot → 分流到单条或批量）
+      batch.py 负责批量的活（读表 → 逐行调用 → 逐行容错 → 写表）
+
+  设计要点：
+    · --file 与 --input 用 argparse 的互斥组，同时给会直接报错
+    · 批量用 for 循环而不是 pandas 向量化 —— 因为每行都要等一次 HTTP 请求（慢 I/O）
+    · 单行失败只记进 error 列，不影响其他行
+    · 原表 data.csv 永不覆盖，结果另存 out.csv
 
 v0.5 变化：
   把"连哪家厂商"从代码里搬到了环境变量里，一套代码通吃所有 OpenAI 兼容服务：
@@ -330,11 +345,69 @@ def read_text_file(path: str) -> str:
         return f.read()
 
 
+# ============================================================
+# 5) 批量模式：读 CSV → 逐行摘要 → 写回新 CSV
+#    ★v1.1 新增。真正的逻辑在 batch.py，这里只负责"组装 + 串起来"。
+# ============================================================
+def run_batch(args) -> None:
+    """
+    --input 模式下走这条路。
+
+    职责边界要说清楚：
+      本函数  负责"准备"——读配置、造 bot、把参数传下去
+      batch.py 负责"干活"——读表、循环、容错、写表
+    """
+    # ↓ 延迟导入（lazy import）：只在真的用批量模式时才加载 pandas。
+    #   好处：单条模式（--file）启动不用等 pandas 那 1 秒的导入时间。
+    #   这也是"按需加载"的典型用法——主流程不该为边角功能付代价。
+    import batch
+
+    # 1. 配置 → 客户端 → 摘要器，和单条模式完全一样
+    config = Config.from_env()
+    bot = Summarizer(LLMClient(config), max_sentences=args.length)
+
+    # 光看日志你还不够放心？这行把"连到哪"和"读的哪个文件"都摊开
+    logger.info("🤖 模型：%s ｜ 端点：%s", config.model, config.api_url)
+
+    # 2. 读表（含列校验、--limit 截断）
+    df = batch.load_input(args.input, args.text_col, args.limit)
+    logger.info("📄 读入 %s 行，正文列 = %s", len(df), args.text_col)
+
+    # 3. 逐行摘要（batch.py 里的核心循环）
+    df = batch.summarize_rows(bot, df, args.text_col)
+
+    # 4. 写新表 + 汇总
+    batch.save_output(df, args.output)
+    batch.print_summary(df)
+    print(f"✅ 已写出 {args.output}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="大模型文本摘要器")
-    parser.add_argument("--file", help="要摘要的文本文件路径（如 sample.txt）")
     parser.add_argument("--length", type=int, default=3, help="摘要句数，默认 3")
+
+    # ★v1.1：--file 和 --input 是两条互斥的路，不能同时给。
+    #   add_mutually_exclusive_group() 让 argparse 自己检查：
+    #   用户同时传两个，会直接报错 "argument --input: not allowed with argument --file"。
+    #   不用你写 if 判断——能用工具约束的，就别用代码兜。
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--file", help="单条模式：要摘要的文本文件（如 sample.txt）")
+    source.add_argument("--input", help="批量模式：要处理的 CSV（如 data.csv）")
+
+    # 下面三个只在批量模式生效，有默认值所以不带也不会报错
+    parser.add_argument("--text-col", default="content",
+                        help="批量模式：哪一列是正文，默认 content")
+    parser.add_argument("--output", default="out.csv",
+                        help="批量模式：结果写到哪个 CSV，默认 out.csv")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="批量模式：只处理前 N 行（调试用，省钱）")
+
     args = parser.parse_args()
+
+    # 0. 批量模式分流（在拿文本之前就分开，两条路互不干扰）
+    if args.input:
+        run_batch(args)
+        return
 
     # 1. 拿到要摘要的文本
     if args.file:
