@@ -155,16 +155,30 @@ let model = null;
  * ============================================================ */
 function initCloud() {
   if (typeof WorkBuddyCloud === "undefined") {
-    showBanner("云服务 SDK 没能加载（可能是网络问题），请刷新重试。");
+    markCloudUnavailable();
     return false;
   }
   try {
     cloud = WorkBuddyCloud.createWorkBuddyCloud(PUBLIC_CONFIG);
     return true;
   } catch (e) {
-    showBanner("云服务初始化失败：" + (e && e.message ? e.message : e));
+    console.warn("云服务初始化失败", e);
+    markCloudUnavailable();
     return false;
   }
+}
+
+/* 云服务 SDK 拿不到时，只把选项标灰——
+ * 不要一进页面就弹黄色横幅：默认走「我的 Key」的人根本没用到云服务，
+ * 那句"云服务加载失败"只会让他以为整个服务坏了。
+ */
+function markCloudUnavailable() {
+  const opt = document.querySelector('#engine option[value="cloud"]');
+  if (opt) {
+    opt.disabled = true;
+    opt.textContent = "云服务（暂不可用）";
+  }
+  if ($("engine").value === "cloud") $("engine").value = "own";
 }
 
 function showBanner(msg) {
