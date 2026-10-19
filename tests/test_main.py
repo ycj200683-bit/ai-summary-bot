@@ -304,3 +304,48 @@ def test_chat_404_报错提示要指明该检查配置(monkeypatch):
     message = str(exc_info.value)
     assert "API_BASE_URL" in message
     assert "MODEL_NAME" in message
+
+
+# ============================================================
+# 句数校验（v1.3）：提示词要求"正好 N 句"，模型未必照做
+# ============================================================
+def test_count_sentences_中英文标点都算一句():
+    assert main.count_sentences("甲。乙！丙？丁!") == 4
+    assert main.count_sentences("这句话没有标点") == 0
+    assert main.count_sentences("") == 0
+
+
+def test_summarize_句数不符时只重写一次():
+    class FakeClient:
+        """第一次故意给 3 句（要求 5 句），第二次给对。"""
+
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, system, user):
+            self.calls += 1
+            if self.calls == 1:
+                return "第一句。第二句。第三句。"
+            return "一。二。三。四。五。"
+
+    fake = FakeClient()
+    bot = Summarizer(fake, max_sentences=5)
+
+    assert bot.summarize("原文") == "一。二。三。四。五。"
+    assert fake.calls == 2          # 只补一次，不会无限重试烧额度
+
+
+def test_summarize_句数正确时不重复调用():
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, system, user):
+            self.calls += 1
+            return "一。二。三。四。五。"
+
+    fake = FakeClient()
+    bot = Summarizer(fake, max_sentences=5)
+
+    bot.summarize("原文")
+    assert fake.calls == 1          # 一次就够，不做多余请求

@@ -308,6 +308,39 @@ async function recordStats(row) {
 }
 
 /* ============================================================
+ * 6.2) 流式调用一次，边收边渲染，返回完整文本
+ *      抽出来是因为"句数不对要重写"会调第二次——不抽出来就得复制一遍循环。
+ * ============================================================ */
+async function streamOnce(modelId, system, userText, bodyEl) {
+  let acc = "";
+  const stream = cloud.llm.chat.completions.create({
+    model: modelId,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: userText }
+    ],
+    stream: true,
+    temperature: 0.3,
+    stream_options: { include_usage: true }
+  });
+
+  for await (const chunk of stream) {
+    const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
+    if (delta && delta.content) {
+      acc += delta.content;
+      bodyEl.textContent = acc;      // 边收边渲染
+    }
+  }
+  return acc;
+}
+
+/* 数句子：中文的句子边界就是标点，和 main.py 里的 count_sentences 保持一致 */
+function countSentences(s) {
+  const m = (s || "").match(/[。！？!?]/g);
+  return m ? m.length : 0;
+}
+
+/* ============================================================
  * 6) 错误提示：按 error.code 前缀给不同的人话
  * ============================================================ */
 function describeError(e) {
@@ -386,28 +419,24 @@ async function doSummarize() {
       modelUsed = m.id;
 
       // system 消息必须是应用自己写的固定内容，不能把用户输入拼进去
-      const stream = cloud.llm.chat.completions.create({
-        model: m.id,
-        messages: [
-          {
-            role: "system",
-            content:
-              "你是一个简洁、准确的中文摘要助手。用不超过 " + sentences +
-              " 句话概括用户给出的内容，只输出摘要正文，不要加标题、不要用 Markdown 列表。"
-          },
-          { role: "user", content: text }
-        ],
-        stream: true,
-        temperature: 0.3,
-        stream_options: { include_usage: true }
-      });
+      const system =
+        "你是一个简洁、准确的中文摘要助手。请写正好 " + sentences +
+        " 句话概括用户给出的内容：每句话只讲一个要点，每句话都以句号结尾，" +
+        "全文一共 " + sentences + " 个句号；不要合并句子，不要分点，" +
+        "不要加标题，不要用 Markdown 列表。";
 
-      for await (const chunk of stream) {
-        const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
-        if (delta && delta.content) {
-          answer += delta.content;
-          body.textContent = answer;  // 边收边渲染
-        }
+      answer = await streamOnce(m.id, system, text, body);
+
+      // 提示词是"请求"不是"契约"：模型仍可能少写或把两句并成一句。
+      // 句数不对就带纠正要求重写一次（只一次，避免积分翻倍）。
+      if (countSentences(answer) !== sentences) {
+        const got = countSentences(answer);
+        status.textContent = "句数不足，正在补齐…";
+        const fix =
+          "你刚才写的不是 " + sentences + " 句（是 " + got + " 句）。" +
+          "请重写：必须正好 " + sentences + " 句话，每句话以句号结尾，" +
+          "只输出摘要正文，不要解释。";
+        answer = await streamOnce(m.id, system, text + "\n\n" + fix, body);
       }
       costMs = Math.round(performance.now() - started);
     }

@@ -345,6 +345,24 @@ class LLMClient:
 # 4) Summarizer：只负责"业务"——给文本，出摘要
 #    它不关心 HTTP 怎么发、key 从哪来，这些 LLMClient 已经包好了
 # ============================================================
+
+# 中文里能结束一句话的标点。英文句点也算，因为模型有时会混用。
+SENTENCE_ENDS = "。！？!?"
+
+
+def count_sentences(text: str) -> int:
+    """
+    数一句话都数不清，就管不住"要几句"这件事。
+
+    ★ 为什么按标点数而不是按换行/空格切：
+      中文没有词间空格，句子的唯一边界就是标点。模型写"甲乙。"和"甲。乙。"
+      的区别只体现在标点数量上，按标点数最贴近人的直觉。
+    ★ 已知局限：英文缩写（如 "Mr.")、小数（"3.5" 无句号不受影响）、
+      以及引号里套着完整句子时会多算——摘要场景基本碰不到，不值得为它写解析器。
+    """
+    return sum(1 for ch in text if ch in SENTENCE_ENDS)
+
+
 class Summarizer:
     """组合 LLMClient 完成'摘要'这件事。"""
 
@@ -354,17 +372,42 @@ class Summarizer:
 
     def _build_prompt(self, text: str) -> tuple[str, str]:
         """拼出 (系统提示词, 用户提示词)。下划线开头 = 内部用的方法。"""
+        # ★ 为什么不再写"以内 / 不超过"：
+        #   用户点的是"5 句话"，期待就是 5 句。"以内"是个上限，模型给 3 句也算
+        #   完成任务——这不是模型不听话，是提示词本身就没要求写满。
+        #   改成"正好 N 句"并给出可数的硬指标（几个句号），模型才有依据照做。
         system = (
-            f"你是一个简洁、准确的中文摘要助手，"
-            f"用 {self.max_sentences} 句话以内概括要点。"
+            f"你是一个简洁、准确的中文摘要助手。"
+            f"请写正好 {self.max_sentences} 句话概括要点："
+            f"每句话只讲一个要点，每句话都以句号结尾，全文一共 {self.max_sentences} 个句号；"
+            f"不要合并句子，不要分点，不要加标题。"
         )
         user = f"请简要总结以下内容：\n{text}"
         return system, user
 
     def summarize(self, text: str) -> str:
-        """对外唯一入口：丢进文本，吐出摘要。"""
+        """对外唯一入口：丢进文本，吐出摘要。
+
+        提示词是"请求"，不是"契约"——模型仍有概率少写或合并句子。
+        所以这里做一次句数校验，不符就带着纠正要求重写一次（只重试一次，避免成本失控）。
+        """
         system, user = self._build_prompt(text)
-        return self.client.chat(system, user)
+        result = self.client.chat(system, user)
+
+        got = count_sentences(result)
+        if got == self.max_sentences:
+            return result
+
+        logger.warning(
+            "✍️ 句数不符：要求 %d 句，实际 %d 句 → 带纠正要求重写一次",
+            self.max_sentences, got,
+        )
+        fix = (
+            f"你刚才写的不是 {self.max_sentences} 句（是 {got} 句）。"
+            f"请重写：必须正好 {self.max_sentences} 句话，每句话以句号结尾，"
+            f"只输出摘要正文，不要解释。"
+        )
+        return self.client.chat(system, user + "\n\n" + fix)
 
 
 # ============================================================
