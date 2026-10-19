@@ -41,8 +41,25 @@ import pandas as pd      # 本次的主角
 # pandas 的惯例是 import ... as pd，全世界的代码都这么写，跟着写就行
 
 
-CORPUS_DIR = "corpus"          # 语料目录（相对于脚本运行位置）
-OUT_CSV = "data.csv"           # 输出文件名
+# ============================================================
+# 路径基准：★ 这一段是踩过坑改的，务必读懂
+#   之前的写法是 CORPUS_DIR = "corpus"（相对路径）。
+#   相对路径的参照物是「你从哪个目录启动脚本」，叫 cwd（current working directory）。
+#   于是出现这种现象：
+#       在项目目录里运行  → 找到 corpus/  → 正常
+#       在 C:\Users\QQ229 里运行 → 去找 C:\Users\QQ229\corpus\ → 报"没有 txt 文件"
+#   代码一个字没改，只因为"从哪儿运行"不同就成败不同——这是新手最迷惑的 bug 之一。
+#
+#   解法：以「脚本自己所在的目录」为基准，与 cwd 彻底解耦。
+#       __file__                  当前这个 .py 文件的路径（可能是相对的）
+#       os.path.abspath(__file__) 转成绝对路径
+#       os.path.dirname(...)      取它所在的文件夹
+#   这样不管你从 C:\、从桌面、还是从 Git Bash 里启动，结果都一样。
+# ============================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CORPUS_DIR = os.path.join(BASE_DIR, "corpus")     # 语料目录（绝对路径）
+OUT_CSV = os.path.join(BASE_DIR, "data.csv")      # 输出文件（绝对路径）
 MIN_CHARS = 500                # 正文最少多少字才算合格，太短的丢掉
 
 
@@ -129,6 +146,8 @@ def build_dataframe(rows: list[dict]) -> pd.DataFrame:
       df = pd.DataFrame(rows)          ← 就一行
       return df
     """
+    df = pd.DataFrame(rows) 
+    return df
     df = TODO_未实现(
         "TODO 1：用 pd.DataFrame(rows) 把字典列表转成表格，然后 return df"
     )
@@ -161,6 +180,8 @@ def add_char_count(df: pd.DataFrame) -> pd.DataFrame:
       df["chars"] = df["content"].str.len()
       return df
     """
+    df["chars"] = df["content"].str.len()
+    return df
     TODO_未实现(
         "TODO 2：给 df 新增一列 chars，用 df['content'].str.len() 算每篇字数"
     )
@@ -186,6 +207,9 @@ def report(df: pd.DataFrame) -> None:
     TODO_未实现(
         "TODO 3：打印 df.shape、df.head(3)、以及字数的最小/最大/平均值"
     )
+    print(df.shape)      
+    print(df.head(3))     
+    print(df["chars"].min(), df["chars"].max(), df["chars"].mean())
 
 
 # ============================================================
@@ -216,6 +240,7 @@ def save_csv(df: pd.DataFrame, path: str) -> None:
     TODO_未实现(
         "TODO 4：用 df.to_csv(path, index=False, encoding='utf-8-sig') 写文件"
     )
+    df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
 # ============================================================
@@ -224,7 +249,8 @@ def save_csv(df: pd.DataFrame, path: str) -> None:
 def main():
     files = list_corpus_files()
     if not files:
-        print(f"❌ {CORPUS_DIR}/ 里没有 txt 文件")
+        print(f"❌ 这个目录里没有 txt 文件：\n   {CORPUS_DIR}")
+        print("   请确认 corpus/ 已建好、且里面是 001.txt 这样的文件")
         sys.exit(1)
 
     print(f"找到 {len(files)} 个语料文件\n")
