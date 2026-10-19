@@ -1,0 +1,5 @@
+# Web 服务所需的最小依赖（不含 pandas，部署更快、体积更小）
+# pandas 只有批量模式 batch.py 用，而 app.py 不 import 它
+requests>=2.31.0
+fastapi>=0.110
+uvicorn>=0.27
