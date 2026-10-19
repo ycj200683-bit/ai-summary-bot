@@ -228,172 +228,42 @@ def summarize(payload: SummarizeIn, request: Request) -> SummarizeOut:
     )
 
 
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+INDEX_FILE = os.path.join(WEB_DIR, "index.html")
+
+
+@app.post("/api/quota/take")
+def quota_take(request: Request) -> dict:
+    """
+    取一次额度。前端在调云服务大模型之前先来这里。
+
+    ★ 为什么限流留在 Python 后端、不放到前端：
+      前端的任何计数都能被用户改（改 JS、清 localStorage）。
+      服务端按 IP 记账才拦得住。云服务用的是平台的额度，
+      这里这一道闸门是"我们自己的"闸门，两层都要有。
+    """
+    remaining = check_quota(client_ip(request))
+    return {"ok": True, "remaining": remaining, "limit": MAX_CALLS_PER_DAY}
+
+
 @app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    return PAGE
+def index():
+    """
+    返回前端页面（web/index.html）。
 
-
-# ============================================================
-# 5) 前端页面（单文件，不依赖任何 CDN，离线也能开）
-# ============================================================
-PAGE = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI 摘要服务</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-                 "Microsoft YaHei", sans-serif;
-    background: #f6f7f9; color: #1a1a1a; line-height: 1.6;
-    min-height: 100vh; padding: 32px 16px 64px;
-  }
-  .wrap { max-width: 760px; margin: 0 auto; }
-  header { margin-bottom: 24px; }
-  h1 { font-size: 26px; font-weight: 700; letter-spacing: -0.3px; }
-  h1 span { color: #4f46e5; }
-  .sub { color: #6b7280; font-size: 14px; margin-top: 6px; }
-  .card {
-    background: #fff; border: 1px solid #e5e7eb; border-radius: 14px;
-    padding: 20px; box-shadow: 0 1px 2px rgba(0,0,0,.04);
-  }
-  textarea {
-    width: 100%; min-height: 180px; padding: 14px; font-size: 15px;
-    font-family: inherit; line-height: 1.7; color: #111827;
-    border: 1px solid #d1d5db; border-radius: 10px; resize: vertical;
-    outline: none; transition: border-color .15s;
-  }
-  textarea:focus { border-color: #4f46e5; box-shadow: 0 0 0 3px rgba(79,70,229,.1); }
-  .row { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
-  .count { font-size: 13px; color: #9ca3af; font-variant-numeric: tabular-nums; }
-  .count.over { color: #dc2626; font-weight: 600; }
-  select {
-    padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 8px;
-    background: #fff; font-size: 14px; font-family: inherit; color: #374151;
-  }
-  button {
-    margin-left: auto; padding: 10px 22px; font-size: 15px; font-weight: 600;
-    color: #fff; background: #4f46e5; border: none; border-radius: 9px;
-    cursor: pointer; transition: background .15s, transform .05s;
-  }
-  button:hover:not(:disabled) { background: #4338ca; }
-  button:active:not(:disabled) { transform: translateY(1px); }
-  button:disabled { background: #a5b4fc; cursor: not-allowed; }
-  .out { margin-top: 20px; display: none; }
-  .out.show { display: block; }
-  .out-head {
-    display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
-    font-size: 13px; color: #6b7280;
-  }
-  .badge {
-    background: #eef2ff; color: #4338ca; padding: 3px 9px; border-radius: 6px;
-    font-weight: 600; font-variant-numeric: tabular-nums;
-  }
-  .body {
-    background: #fafafa; border: 1px solid #eee; border-radius: 10px;
-    padding: 16px; font-size: 15px; white-space: pre-wrap; color: #1f2937;
-  }
-  .err { background: #fef2f2; border-color: #fecaca; color: #b91c1c; }
-  footer { margin-top: 28px; font-size: 13px; color: #9ca3af; text-align: center; }
-  footer a { color: #6b7280; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header>
-    <h1>AI <span>摘要</span>服务</h1>
-    <p class="sub">贴一段中文，返回三句话以内的要点。单次上限 5000 字，每人每天 20 次。</p>
-  </header>
-
-  <div class="card">
-    <textarea id="text" placeholder="把要摘要的正文粘在这里，例如一篇新闻报道、一段会议记录、一份论文摘要……"></textarea>
-    <div class="row">
-      <span class="count" id="count">0 / 5000</span>
-      <select id="len">
-        <option value="2">2 句话</option>
-        <option value="3" selected>3 句话</option>
-        <option value="5">5 句话</option>
-      </select>
-      <button id="go">生成摘要</button>
-    </div>
-  </div>
-
-  <div class="out" id="out">
-    <div class="out-head">
-      <span id="status"></span>
-      <span class="badge" id="latency"></span>
-      <span class="badge" id="model"></span>
-    </div>
-    <div class="body" id="body"></div>
-  </div>
-
-  <footer>
-    后端 FastAPI · 前端原生 JS · 模型接口 OpenAI 兼容协议<br>
-    接口文档见 <a href="/docs">/docs</a> · 健康检查 <a href="/api/health">/api/health</a>
-  </footer>
-</div>
-
-<script>
-const MAX = 5000;
-const $ = (id) => document.getElementById(id);
-const ta = $('text');
-
-ta.addEventListener('input', () => {
-  const n = ta.value.length;
-  $('count').textContent = n + ' / ' + MAX;
-  $('count').classList.toggle('over', n > MAX);
-});
-
-$('go').addEventListener('click', async () => {
-  const text = ta.value.trim();
-  const out = $('out'), body = $('body'), status = $('status');
-
-  if (!text) { alert('先贴点内容'); return; }
-  if (text.length > MAX) { alert('超过 5000 字了，删短一点'); return; }
-
-  const btn = $('go');
-  btn.disabled = true;
-  btn.textContent = '生成中…';
-
-  try {
-    const resp = await fetch('/api/summarize', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: text, length: parseInt($('len').value, 10) })
-    });
-    const data = await resp.json();
-
-    out.classList.add('show');
-    body.classList.remove('err');
-
-    if (!resp.ok) {
-      status.textContent = '请求失败';
-      body.classList.add('err');
-      body.textContent = (data && data.detail) ? data.detail : ('HTTP ' + resp.status);
-      $('latency').textContent = '';
-      $('model').textContent = '';
-      return;
-    }
-
-    status.textContent = '摘要结果';
-    body.textContent = data.summary;
-    $('latency').textContent = data.latency_ms + ' ms · ' + data.input_chars + ' 字';
-    $('model').textContent = data.model;
-  } catch (e) {
-    out.classList.add('show');
-    body.classList.add('err');
-    status.textContent = '出错了';
-    body.textContent = String(e);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '生成摘要';
-  }
-});
-</script>
-</body>
-</html>"""
+    ★ 为什么把页面从这里挪出去：
+      这个页面现在要加载云服务 SDK、读写云数据库、流式渲染，JS 已经有几百行。
+      前后端混在同一个三引号字符串里，动一边容易碰坏另一边
+      （前面那几次三引号事故就是教训）。物理分开，各自好改。
+    """
+    try:
+        with open(INDEX_FILE, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return HTMLResponse(
+            "<h1>web/index.html 找不到</h1><p>前端文件没有跟着部署包一起上传。</p>",
+            status_code=500,
+        )
 
 
 # ============================================================

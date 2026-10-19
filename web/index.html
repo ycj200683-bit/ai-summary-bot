@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 摘要服务</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Microsoft YaHei", sans-serif;
+    background: #f6f7f9; color: #1a1a1a; line-height: 1.6;
+    min-height: 100vh; padding: 28px 16px 56px;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  header { margin-bottom: 18px; }
+  h1 { font-size: 25px; font-weight: 700; letter-spacing: -0.3px; }
+  h1 span { color: #4f46e5; }
+  .sub { color: #6b7280; font-size: 14px; margin-top: 5px; }
+
+  .stats {
+    display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap;
+  }
+  .stat {
+    flex: 1 1 140px; background: #fff; border: 1px solid #e5e7eb;
+    border-radius: 11px; padding: 11px 14px;
+  }
+  .stat .k { font-size: 12px; color: #9ca3af; }
+  .stat .v {
+    font-size: 19px; font-weight: 700; color: #111827;
+    font-variant-numeric: tabular-nums; margin-top: 1px;
+  }
+
+  .card {
+    background: #fff; border: 1px solid #e5e7eb; border-radius: 14px;
+    padding: 20px; box-shadow: 0 1px 2px rgba(0,0,0,.04);
+  }
+  textarea {
+    width: 100%; min-height: 170px; padding: 14px; font-size: 15px;
+    font-family: inherit; line-height: 1.7; color: #111827;
+    border: 1px solid #d1d5db; border-radius: 10px; resize: vertical;
+    outline: none; transition: border-color .15s;
+  }
+  textarea:focus { border-color: #4f46e5; box-shadow: 0 0 0 3px rgba(79,70,229,.1); }
+  .row { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
+  .count { font-size: 13px; color: #9ca3af; font-variant-numeric: tabular-nums; }
+  .count.over { color: #dc2626; font-weight: 600; }
+  select {
+    padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 8px;
+    background: #fff; font-size: 14px; font-family: inherit; color: #374151;
+  }
+  button.primary {
+    margin-left: auto; padding: 10px 22px; font-size: 15px; font-weight: 600;
+    color: #fff; background: #4f46e5; border: none; border-radius: 9px;
+    cursor: pointer; transition: background .15s, transform .05s;
+  }
+  button.primary:hover:not(:disabled) { background: #4338ca; }
+  button.primary:active:not(:disabled) { transform: translateY(1px); }
+  button.primary:disabled { background: #a5b4fc; cursor: not-allowed; }
+
+  .out { margin-top: 20px; display: none; }
+  .out.show { display: block; }
+  .out-head {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+    font-size: 13px; color: #6b7280; flex-wrap: wrap;
+  }
+  .badge {
+    background: #eef2ff; color: #4338ca; padding: 3px 9px; border-radius: 6px;
+    font-weight: 600; font-variant-numeric: tabular-nums;
+  }
+  .body {
+    background: #fafafa; border: 1px solid #eee; border-radius: 10px;
+    padding: 16px; font-size: 15px; white-space: pre-wrap; color: #1f2937;
+  }
+  .err { background: #fef2f2; border-color: #fecaca; color: #b91c1c; }
+  .banner {
+    display: none; margin-bottom: 14px; padding: 11px 14px; border-radius: 10px;
+    font-size: 14px; background: #fffbeb; border: 1px solid #fde68a; color: #92400e;
+  }
+  .banner.show { display: block; }
+  footer { margin-top: 24px; font-size: 13px; color: #9ca3af; text-align: center; }
+  footer a { color: #6b7280; }
+  .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #10b981; margin-right: 5px; vertical-align: middle; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="banner" id="banner"></div>
+
+  <header>
+    <h1>AI <span>摘要</span>服务</h1>
+    <p class="sub">贴一段中文，返回几句话的要点。单次上限 5000 字。</p>
+  </header>
+
+  <div class="stats">
+    <div class="stat"><div class="k">累计生成</div><div class="v" id="s-total">—</div></div>
+    <div class="stat"><div class="k">平均耗时</div><div class="v" id="s-avg">—</div></div>
+    <div class="stat"><div class="k">今日调用</div><div class="v" id="s-today">—</div></div>
+  </div>
+
+  <div class="card">
+    <textarea id="text" placeholder="把要摘要的正文粘在这里，例如一篇新闻报道、一段会议记录、一份论文摘要……"></textarea>
+    <div class="row">
+      <span class="count" id="count">0 / 5000</span>
+      <select id="len">
+        <option value="2">2 句话</option>
+        <option value="3" selected>3 句话</option>
+        <option value="5">5 句话</option>
+      </select>
+      <button class="primary" id="go">生成摘要</button>
+    </div>
+  </div>
+
+  <div class="out" id="out">
+    <div class="out-head">
+      <span id="status"></span>
+      <span class="badge" id="latency"></span>
+      <span class="badge" id="model"></span>
+    </div>
+    <div class="body" id="body"></div>
+  </div>
+
+  <footer>
+    <span class="dot"></span>摘要由云服务大模型生成 · 调用记录存于云端数据库<br>
+    接口文档见 <a href="/docs">/docs</a> · 健康检查 <a href="/api/health">/api/health</a>
+  </footer>
+</div>
+
+<!-- 云服务 SDK（纯 HTML 项目用 CDN 形式，全局变量 WorkBuddyCloud） -->
+<script src="https://cdn.jsdelivr.net/npm/@tencent-ai/workbuddy-cloud-sdk@dev/lib/index.global.js"></script>
+<script>
+/* ============================================================
+ * 1) 云服务配置
+ *    这四个值来自云服务开通时返回的 publicConfig，原样照抄，不要手改。
+ *    publishableKey 本身不带任何权限，服务端会校验 Origin 是否匹配。
+ * ============================================================ */
+const PUBLIC_CONFIG = {
+  endpoint: "https://ai-summary-svc.app.workbuddy.host",
+  oauthRelayBaseUrl: "https://www.workbuddy.cn/v2/as/genie-baas/oauth",
+  publishableKey: "wbpk_OCO14d6ljHR5OcR6J723m4_lLVUFsVKDiOV1MO4ATZsjM6fY3dNLKDB"
+};
+
+const MAX = 5000;
+const $ = (id) => document.getElementById(id);
+
+let cloud = null;
+let model = null;
+
+/* ============================================================
+ * 2) 初始化客户端（整个页面只建一次，所有模块共用）
+ * ============================================================ */
+function initCloud() {
+  if (typeof WorkBuddyCloud === "undefined") {
+    showBanner("云服务 SDK 没能加载（可能是网络问题），请刷新重试。");
+    return false;
+  }
+  try {
+    cloud = WorkBuddyCloud.createWorkBuddyCloud(PUBLIC_CONFIG);
+    return true;
+  } catch (e) {
+    showBanner("云服务初始化失败：" + (e && e.message ? e.message : e));
+    return false;
+  }
+}
+
+function showBanner(msg) {
+  const b = $("banner");
+  b.textContent = msg;
+  b.classList.add("show");
+}
+
+/* ============================================================
+ * 3) 模型列表：第一次调用前取一次，选第一个没被禁用的
+ * ============================================================ */
+async function getModel() {
+  if (model) return model;
+  const models = await cloud.llm.models.list();
+  if (!models || models.length === 0) {
+    throw new Error("当前没有可用模型，请稍后再试");
+  }
+  const picked = models.find((m) => m.disabled !== true);
+  if (!picked) throw new Error("模型目录里没有可用的模型");
+  model = picked;
+  return model;
+}
+
+/* ============================================================
+ * 4) 统计条：读云端数据库（公开只读）
+ * ============================================================ */
+async function refreshStats() {
+  try {
+    const { data, count, error } = await cloud.database
+      .from("summary_stats")
+      .select("input_chars, latency_ms, created_at", { count: "exact" })
+      .order("created_at", { ascending: false })
+      .limit(200);
+
+    if (error) throw error;
+
+    if (typeof count === "number") {
+      $("s-total").textContent = count + " 篇";
+    } else {
+      $("s-total").textContent = (data ? data.length : 0) + " 篇";
+    }
+
+    const rows = data || [];
+    if (rows.length) {
+      const avg = rows.reduce((s, r) => s + (r.latency_ms || 0), 0) / rows.length;
+      $("s-avg").textContent = Math.round(avg) + " ms";
+    } else {
+      $("s-avg").textContent = "—";
+    }
+
+    const today = new Date().toDateString();
+    $("s-today").textContent =
+      rows.filter((r) => r.created_at && new Date(r.created_at).toDateString() === today).length + " 次";
+  } catch (e) {
+    // 统计失败不影响主流程，不弹错误
+    console.warn("统计读取失败", e);
+  }
+}
+
+/* ============================================================
+ * 5) 额度检查：仍然走 Python 后端（服务端限流比前端可靠）
+ * ============================================================ */
+async function takeQuota() {
+  const resp = await fetch("/api/quota/take", { method: "POST" });
+  if (resp.ok) return;
+  let detail = "今天的额度已用完";
+  try {
+    const j = await resp.json();
+    if (j && j.detail) detail = j.detail;
+  } catch (_) { /* 忽略解析失败 */ }
+  throw new Error(detail);
+}
+
+/* ============================================================
+ * 6) 错误提示：按 error.code 前缀给不同的人话
+ * ============================================================ */
+function describeError(e) {
+  const code = (e && e.error && e.error.code) || "";
+  const msg = (e && e.error && e.error.message) || (e && e.message) || String(e);
+  if (code.indexOf("auth_") === 0) return "云服务鉴权没通过（可能是当前域名不在白名单里）：" + code;
+  if (code.indexOf("quota_") === 0) return "平台额度已用完或限流，稍后再试：" + code;
+  if (code.indexOf("request_") === 0) return "请求参数或模型不匹配：" + msg;
+  if (code.indexOf("gateway_") === 0 || code.indexOf("model_") === 0) return "模型服务暂时不可用，请点重试：" + code;
+  if (code.indexOf("internal_") === 0) return "服务内部错误：" + (e.requestId ? "requestId " + e.requestId : msg);
+  return msg;
+}
+
+/* ============================================================
+ * 7) 主流程
+ * ============================================================ */
+async function doSummarize() {
+  const ta = $("text");
+  const text = ta.value.trim();
+  const out = $("out"), body = $("body"), status = $("status");
+  const btn = $("go");
+
+  if (!text) { alert("先贴点内容"); return; }
+  if (text.length > MAX) { alert("超过 5000 字了，删短一点"); return; }
+  if (!cloud) { showBanner("云服务尚未就绪，请刷新页面。"); return; }
+
+  btn.disabled = true;
+  btn.textContent = "生成中…";
+  out.classList.add("show");
+  body.classList.remove("err");
+  body.textContent = "";
+  status.textContent = "生成中";
+  $("latency").textContent = "";
+  $("model").textContent = "";
+
+  const started = performance.now();
+
+  try {
+    // ① 服务端额度闸门
+    await takeQuota();
+
+    // ② 选模型
+    const m = await getModel();
+
+    // ③ 流式调用云服务大模型
+    //   system 消息必须是应用自己写的固定内容，不能把用户输入拼进去
+    const sentences = [2, 3, 5].includes(parseInt($("len").value, 10))
+      ? parseInt($("len").value, 10) : 3;
+
+    let answer = "";
+    const stream = cloud.llm.chat.completions.create({
+      model: m.id,
+      messages: [
+        {
+          role: "system",
+          content:
+            "你是一个简洁、准确的中文摘要助手。用不超过 " + sentences +
+            " 句话概括用户给出的内容，只输出摘要正文，不要加标题、不要用 Markdown 列表。"
+        },
+        { role: "user", content: text }
+      ],
+      stream: true,
+      temperature: 0.3,
+      stream_options: { include_usage: true }
+    });
+
+    for await (const chunk of stream) {
+      const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
+      if (delta && delta.content) {
+        answer += delta.content;
+        body.textContent = answer;      // 边收边渲染
+      }
+    }
+
+    const costMs = Math.round(performance.now() - started);
+
+    if (!answer.trim()) {
+      throw new Error("模型没有返回内容，请重试");
+    }
+
+    status.textContent = "摘要结果";
+    $("latency").textContent = costMs + " ms · " + text.length + " 字";
+    $("model").textContent = m.id;
+
+    // ④ 写入云端数据库（只存元数据，不存正文与摘要内容）
+    //    owner_id 一律不传：库里有 DEFAULT auth.uid()，未登录时就是 null
+    const { error } = await cloud.database.from("summary_stats").insert({
+      input_chars: text.length,
+      output_chars: answer.length,
+      latency_ms: costMs,
+      model: m.id
+    });
+    if (error) {
+      console.warn("记录写入失败", error);
+    }
+
+    await refreshStats();
+  } catch (e) {
+    body.classList.add("err");
+    body.textContent = describeError(e);
+    status.textContent = "出错了";
+    $("latency").textContent = "";
+    $("model").textContent = "";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "生成摘要";
+  }
+}
+
+/* ============================================================
+ * 8) 事件绑定
+ * ============================================================ */
+$("text").addEventListener("input", () => {
+  const n = $("text").value.length;
+  $("count").textContent = n + " / " + MAX;
+  $("count").classList.toggle("over", n > MAX);
+});
+
+$("go").addEventListener("click", doSummarize);
+
+// 页面就绪后初始化并拉一次统计
+if (initCloud()) {
+  refreshStats();
+}
+
+/* 临时自检钩子（验证完就删）：带 ?selftest=1 打开会自动跑一次完整流程 */
+if (location.search.indexOf("selftest=1") !== -1) {
+  $("text").value = "青海大学位于西宁，是一所综合性大学。学校海拔较高，气候干燥，冬季寒冷。学校设有多个学院，计算机技术与应用学院是其中之一，注重实践能力培养。";
+  doSummarize().then(function () {
+    const d = document.createElement("div");
+    d.id = "selftest-result";
+    d.textContent = "RESULT|" + $("status").textContent + "|" + $("body").textContent.replace(/\s+/g, " ").slice(0, 160) + "|" + $("latency").textContent + "|total=" + $("s-total").textContent;
+    document.body.appendChild(d);
+  });
+}
+</script>
+</body>
+</html>
