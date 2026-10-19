@@ -38,6 +38,34 @@ from main import Config, FatalError, LLMClient, RetryableError, Summarizer
 from main import DEFAULT_MODEL, ENV_MODEL_NAME
 
 
+def _load_dotenv(path: str = ".env") -> None:
+    """
+    极简 .env 读取（不引入 python-dotenv 这种额外依赖）。
+
+    规则只有三条：
+      ① 一行一个 KEY=VALUE；空行和 # 开头的行跳过
+      ② 已经存在的环境变量不覆盖（setdefault）——真实环境变量优先级高于文件
+      ③ 值两端的引号剥掉
+
+    ★ 为什么不把 key 写死在代码里：
+      .env 已经在 .gitignore 里，进不了仓库；代码里硬编码则一推就公开了。
+      密钥只放环境变量或 .env，这是底线，不是风格问题。
+    """
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+# 必须在任何 Config.from_env() 之前执行
+_load_dotenv()
+
+
 # ============================================================
 # 1) 可调参数
 # ============================================================
@@ -45,6 +73,10 @@ MAX_CHARS = 5000          # 单次最多接受多少字（防止有人塞进来�
 MAX_CALLS_PER_DAY = 20    # 每个 IP 每天最多几次
                           # 公开部署必须限流：这背后是真金白银的 API 账单，
                           # 不设上限，一个脚本就能把你的额度刷干净。
+MAX_CALLS_PER_DAY_GLOBAL = 300   # 全站每天总上限
+                          # ★ 只有单 IP 限额是不够的：换个 IP 就绕过去了，
+                          #   或者链接被转发到群里，几十个人同时用照样能刷爆。
+                          #   加一道全站闸门，最坏情况下的账单就是可预期的。
 
 app = FastAPI(
     title="AI 摘要服务",
@@ -114,14 +146,27 @@ def client_ip(request: Request) -> str:
 # IP -> [日期, 已用次数]。进程内存里的简陋限流，重启即清零。
 # 生产环境应该放 Redis —— 但那是另一个阶段的活，现在够用。
 _usage: dict[str, list] = {}
+_global: list = ["", 0]      # [日期, 全站已用次数]
 
 
 def check_quota(ip: str) -> int:
     """用掉一次额度，返回剩余次数。超限抛 429。"""
     today = date.today().isoformat()
+
+    # 第一道闸：全站总量
+    if _global[0] != today:
+        _global[0], _global[1] = today, 0
+    if _global[1] >= MAX_CALLS_PER_DAY_GLOBAL:
+        raise HTTPException(
+            status_code=429,
+            detail="今天的全站额度已用完，明天再来（这是个免费演示服务，额度有限）",
+        )
+
+    # 第二道闸：单个 IP
     rec = _usage.get(ip)
     if not rec or rec[0] != today:
         _usage[ip] = [today, 1]
+        _global[1] += 1
         return MAX_CALLS_PER_DAY - 1
 
     if rec[1] >= MAX_CALLS_PER_DAY:
@@ -130,6 +175,7 @@ def check_quota(ip: str) -> int:
             detail=f"今天的 {MAX_CALLS_PER_DAY} 次额度已用完，明天再来",
         )
     rec[1] += 1
+    _global[1] += 1
     return MAX_CALLS_PER_DAY - rec[1]
 
 
@@ -148,6 +194,8 @@ def health() -> dict:
         "configured": _client is not None or bool(os.getenv("API_KEY") or os.getenv("DEEPSEEK_API_KEY")),
         "max_chars": MAX_CHARS,
         "max_calls_per_day": MAX_CALLS_PER_DAY,
+        "max_calls_per_day_global": MAX_CALLS_PER_DAY_GLOBAL,
+        "used_today_global": _global[1] if _global[0] == date.today().isoformat() else 0,
     }
 
 
@@ -346,3 +394,19 @@ $('go').addEventListener('click', async () => {
 </script>
 </body>
 </html>"""
+
+
+# ============================================================
+# 6) 直接运行入口（部署平台走这条路）
+# ============================================================
+if __name__ == "__main__":
+    # ★ 部署平台的硬性要求：端口从 PORT 环境变量读，并绑 0.0.0.0。
+    #   绑 127.0.0.1 外面访问不到；端口写死则平台分配的端口和你的对不上。
+    #   本地跑没设 PORT，就退回 8000。
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+    )
