@@ -71,6 +71,7 @@ v0.2 变化：
 """
 
 import os
+import re
 import time
 import functools
 import argparse
@@ -381,6 +382,60 @@ def count_sentences(text: str) -> int:
     return sum(1 for ch in text if ch in SENTENCE_ENDS)
 
 
+# 行首的列表符号：`- `、`* `、`1. `、`2、` 之类
+LIST_MARKER = re.compile(r"^\s*(?:[-*•·]|\d{1,2}[.)、])\s*")
+# 中文标点：它们前后出现空格都是排版垃圾
+CJK_PUNCT = "。！？；：，、"
+
+
+def _is_cjk(ch: str) -> bool:
+    return "\u4e00" <= ch <= "\u9fff"
+
+
+def normalize_summary(text: str) -> str:
+    """
+    把模型爱加的排版垃圾收拾干净。
+
+    模型（尤其 DeepSeek 系）经常把几句话写成这样：
+        - 第一句
+        - 第二句
+    或者句子之间插一堆空行。这些在纯文本摘要里没有意义，
+    网页上按 pre-wrap 渲染还会变成难看的空档。
+
+    规则：
+      ① 去掉行首的列表符号（- * 1. 之类），摘要不需要分点
+      ② 丢掉空行，把剩下的行连起来——中文行之间不塞空格，英文之间保留一个空格
+         （中文加空格会变成"每 句 话 都 有 空 隙"，英文不加空格会粘成一个词）
+      ③ 中文标点前后的空格一律删掉（"第一句。 第二句。" → "第一句。第二句。"）
+
+    ★ 为什么用"接行"而不是正则一把梭：
+      这是给人看的文本，判断依据是"前后两个字符是不是中文"，
+      用一行字符串处理逻辑比写一堆正则读起来清楚得多。
+    """
+    if not text:
+        return ""
+
+    lines = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = LIST_MARKER.sub("", line).strip()
+        if line:
+            lines.append(line)
+
+    joined = ""
+    for line in lines:
+        if not joined:
+            joined = line
+        elif _is_cjk(joined[-1]) and _is_cjk(line[0]):
+            joined += line                       # 中文接中文：不加空格
+        else:
+            joined += " " + line                 # 其他情况：留一个空格
+
+    for ch in CJK_PUNCT:                         # 标点前后的空格删掉
+        joined = joined.replace(" " + ch, ch).replace(ch + " ", ch)
+
+    return re.sub(r"[ \t]{2,}", " ", joined).strip()
+
+
 def max_reasonable_sentences(n_chars: int) -> int:
     """
     按正文字数给一个"不把句子拆碎"的句数上限。
@@ -451,7 +506,9 @@ class Summarizer:
             )
 
         system, user = self._build_prompt(text)
-        result = self.client.chat(system, user)
+        # 先规整再数句：模型写成 "- 第一句\n- 第二句" 时，
+        # 不先收拾排版就去数句号也行，但返回值会是带列表符的脏文本。
+        result = normalize_summary(self.client.chat(system, user))
 
         got = count_sentences(result)
         if got == self.sentences_used:
@@ -466,7 +523,7 @@ class Summarizer:
             f"请重写：必须正好 {self.sentences_used} 句话，每句话以句号结尾，"
             f"只输出摘要正文，不要解释。"
         )
-        return self.client.chat(system, user + "\n\n" + fix)
+        return normalize_summary(self.client.chat(system, user + "\n\n" + fix))
 
 
 # ============================================================

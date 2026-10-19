@@ -431,3 +431,38 @@ def test_chat_关思考时才带_enable_thinking_字段(clean_env, monkeypatch):
     # 默认 → 不带字段
     LLMClient(Config(api_key="k")).chat("sys", "user")
     assert "enable_thinking" not in seen["payload"]
+
+
+# ============================================================
+# 排版规整（v1.5）：模型爱加列表符和空行，纯文本摘要里都是噪音
+# ============================================================
+def test_normalize_summary_去掉列表符与空行():
+    messy = "- 第一句。\n\n- 第二句。\n\n- 第三句。"
+    assert main.normalize_summary(messy) == "第一句。第二句。第三句。"
+
+
+def test_normalize_summary_中文接中文不加空格():
+    # 中文句子被换行切断时，直接接上；插空格会变成"每 句 都 有 缝"
+    assert main.normalize_summary("第一句。\n第二句。") == "第一句。第二句。"
+    assert main.normalize_summary("前面半句\n后面半句。") == "前面半句后面半句。"
+
+
+def test_normalize_summary_英文之间保留空格():
+    # 英文不能直接拼，否则 GreatWall 这种词就被粘出来了
+    assert main.normalize_summary("Hello world.\nThis is a test.") == "Hello world. This is a test."
+
+
+def test_normalize_summary_清掉中文标点前后空格():
+    assert main.normalize_summary("第一句。 第二句。") == "第一句。第二句。"
+    assert main.normalize_summary("标题 ：正文") == "标题：正文"
+
+
+def test_summarize_返回值已经规整过():
+    """从 chat 出来的脏文本，要经过 normalize 才交给调用方。"""
+
+    class FakeClient:
+        def chat(self, system, user):
+            return "- 一。\n\n- 二。\n\n- 三。"
+
+    bot = Summarizer(FakeClient(), max_sentences=3)
+    assert bot.summarize("字" * 800) == "一。二。三。"

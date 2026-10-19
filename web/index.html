@@ -349,6 +349,30 @@ function maxReasonableSentences(n) {
   return 5;
 }
 
+/* 规整排版垃圾——和 main.py 的 normalize_summary() 同一套规则：
+ * 去掉行首列表符、丢掉空行、中文之间不塞空格、中文标点前后不留空格 */
+function normalizeSummary(text) {
+  if (!text) return "";
+  const isCjk = (ch) => ch >= "\u4e00" && ch <= "\u9fff";
+
+  const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+    .split("\n")
+    .map((l) => l.replace(/^\s*(?:[-*•·]|\d{1,2}[.)、])\s*/, "").trim())
+    .filter((l) => l.length > 0);
+
+  let joined = "";
+  for (const line of lines) {
+    if (!joined) joined = line;
+    else if (isCjk(joined[joined.length - 1]) && isCjk(line[0])) joined += line;
+    else joined += " " + line;
+  }
+
+  for (const ch of "。！？；：，、") {
+    joined = joined.split(" " + ch).join(ch).split(ch + " ").join(ch);
+  }
+  return joined.replace(/[ \t]{2,}/g, " ").trim();
+}
+
 /* ============================================================
  * 6) 错误提示：按 error.code 前缀给不同的人话
  * ============================================================ */
@@ -439,7 +463,8 @@ async function doSummarize() {
         "全文一共 " + usedSentences + " 个句号；不要合并句子，不要分点，" +
         "不要加标题，不要用 Markdown 列表。";
 
-      answer = await streamOnce(m.id, system, text, body);
+      answer = normalizeSummary(await streamOnce(m.id, system, text, body));
+      body.textContent = answer;    // 规整后再渲染，避免中间闪一下带列表符的版本
 
       // 提示词是"请求"不是"契约"：模型仍可能少写或把两句并成一句。
       // 句数不对就带纠正要求重写一次（只一次，避免积分翻倍）。
@@ -450,7 +475,8 @@ async function doSummarize() {
           "你刚才写的不是 " + usedSentences + " 句（是 " + got + " 句）。" +
           "请重写：必须正好 " + usedSentences + " 句话，每句话以句号结尾，" +
           "只输出摘要正文，不要解释。";
-        answer = await streamOnce(m.id, system, text + "\n\n" + fix, body);
+        answer = normalizeSummary(await streamOnce(m.id, system, text + "\n\n" + fix, body));
+        body.textContent = answer;
       }
       costMs = Math.round(performance.now() - started);
     }
