@@ -188,17 +188,27 @@ function showBanner(msg) {
 }
 
 /* ============================================================
- * 3) 模型列表：第一次调用前取一次，选第一个没被禁用的
+ * 3) 模型列表：优先用和「我的 Key」同款的 deepseek-v4.1-flash
+ *
+ *    ★ 为什么不能"取列表第一个"：平台把 auto 放在第一位，
+ *      而 auto 是【深度思考】模型（只出推理、effort=high）。
+ *      实测同一段文字：auto 首字节 15.5 秒 / 总 16.3 秒，
+ *      deepseek-v4.1-flash 首字节 1.4 秒 / 总 1.7 秒——差 10 倍。
+ *      摘要这种任务用不着深度思考，选贵的那档纯属浪费。
  * ============================================================ */
+const PREFERRED_MODEL = "deepseek-v4.1-flash";
+
 async function getModel() {
   if (model) return model;
   const models = await cloud.llm.models.list();
   if (!models || models.length === 0) {
     throw new Error("当前没有可用模型，请稍后再试");
   }
-  const picked = models.find((m) => m.disabled !== true);
-  if (!picked) throw new Error("模型目录里没有可用的模型");
-  model = picked;
+  const usable = models.filter((m) => m.disabled !== true);
+  if (!usable.length) throw new Error("模型目录里没有可用的模型");
+
+  // 找得到同款就用同款，找不到（平台调整了型号）就退回第一个可用的
+  model = usable.find((m) => m.id === PREFERRED_MODEL) || usable[0];
   return model;
 }
 
