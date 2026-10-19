@@ -35,14 +35,6 @@ STATUS_FAIL = "fail"
 STATUS_SKIP = "skip"
 
 
-def TODO_未实现(说明: str):
-    """占位函数：跑到这里就说明对应的 TODO 还没填。"""
-    raise NotImplementedError(
-        "\n\n还没填的 TODO：\n  " + 说明 + "\n\n"
-        "把整段 TODO_未实现(...) 换成提示的代码，然后再跑一次。\n"
-    )
-
-
 def load_input(path: str, text_col: str, limit: int | None = None) -> pd.DataFrame:
     """
     读入 CSV，检查正文列存在，可选只取前 N 行。
@@ -110,31 +102,31 @@ def summarize_rows(bot, df: pd.DataFrame, text_col: str) -> pd.DataFrame:
         text = str(row[text_col]).strip()
 
         # ==================================================
-        # TODO 1（轮到你了）：空正文要跳过
-        #
-        #   如果 text 是空的（有的文章抓下来可能只剩标题），
-        #   就没必要花一次 API 调用。这种行记 STATUS_SKIP，然后 continue。
-        #
-        #   写完后把下面这行 TODO_未实现 删掉。
+        # TODO 1：空正文跳过，别浪费 API 调用
         # ==================================================
-        TODO_未实现("TODO 1：text 为空时，记 skip 并 continue，别浪费 API 调用")
+        if not text:                      # text 为空字符串就跳过
+            summaries.append("")          # 摘要留空
+            statuses.append(STATUS_SKIP)  # 状态记 SKIP
+            errors.append("")             # 没有错误
+            latencies.append(0)           # 没发请求，耗时为 0
+            continue                      # 直接进入下一行，不调 API
 
         t0 = time.time()          # 开始计时（time.time() 返回秒，小数部分也是秒）
 
         # ==================================================
-        # TODO 2（核心）：调一次 API，并且只让「这一行」失败
-        #
-        #   要返回三个东西：(summary, status, error)
-        #     成功 → (摘要文本, STATUS_OK, "")
-        #     失败 → ("", STATUS_FAIL, f"{type(e).__name__}: {e}")
-        #
-        #   提示：异常对象 e 的类名用 type(e).__name__ 拿，不是 str(type(e))。
-        #   写进 error 列时把类名带上，因为 "Timeout" 和 "FatalError"
-        #   一眼就知道该不该重跑，只剩一句话反而看不出是哪类问题。
+        # TODO 2：调一次 API，并且只让「这一行」失败
+        #   注意：这里没有 return。summary/status/error 是 summarize_rows 的
+        #   局部变量，直接赋值，下面的 append 就能用；加了 return 会结束整个
+        #   函数（只处理第一行就退出）。
         # ==================================================
-        summary, status, error = TODO_未实现(
-            "TODO 2：用 try/except 包住 bot.summarize(text)，返回 (summary, status, error)"
-        )
+        try:
+            summary = bot.summarize(text)
+            status = STATUS_OK
+            error = ""
+        except Exception as e:
+            summary = ""
+            status = STATUS_FAIL
+            error = f"{type(e).__name__}: {e}"
 
         cost_ms = int((time.time() - t0) * 1000)      # 耗时（毫秒，取整）
 
@@ -160,22 +152,8 @@ def summarize_rows(bot, df: pd.DataFrame, text_col: str) -> pd.DataFrame:
 
 
 def save_output(df: pd.DataFrame, path: str) -> None:
-    """
-    存成新文件。原则：原表 data.csv 永不覆盖。
-
-    为什么要另存而不是就地改：
-      摘要跑歪了、prompt 改了要重跑时，原始数据还在，直接重来。
-      就地改的话，一次失误原始数据就没了。
-
-    ==================================================
-    TODO 3（最后一个）：把 df 存成 path
-    ==================================================
-      和 build_corpus.py 里一模一样的那行：
-          df.to_csv(path, index=False, encoding="utf-8-sig")
-      index=False  不要多存一列行号
-      utf-8-sig    带 BOM，Excel 双击打开中文不乱码
-    """
-    TODO_未实现("TODO 3：用 df.to_csv(path, index=False, encoding='utf-8-sig') 保存")
+    """存成新文件，原表 data.csv 永不覆盖（重跑时原始数据还在）。"""
+    df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
 def print_summary(df: pd.DataFrame) -> None:
