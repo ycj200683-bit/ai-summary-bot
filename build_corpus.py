@@ -22,15 +22,32 @@ build_corpus.py —— 把 corpus/*.txt 合成 data.csv（W9 第一个 pandas �
 【怎么跑】
   python build_corpus.py
 
-【你要填的地方】
-  文件里有 4 个 TODO，都长这样：
-      xxx = TODO_未实现("TODO 1：……")
-  看到 NotImplementedError 报错，就说明那个 TODO 还没填。
-  把整段 TODO_未实现(...) 换成它提示的代码即可，不要留半截。
+【状态：已完成】
+  骨架里原来留了 4 个 TODO，俊已全部填好并跑通（2026-10-19）：
+      第 3 步  df = pd.DataFrame(rows)
+      第 4 步  df["chars"] = df["content"].str.len()
+      第 5 步  print(df.shape) / head(3) / 字数 min-max-mean
+      第 6 步  df.to_csv(path, index=False, encoding="utf-8-sig")
+  产出 data.csv：10 行 × 4 列，字数 980–3797，均值 2204.4
 
-【先跑一遍会怎样】
-  前两步（扫文件、解析）已经写好了，会正常打印每个文件的读入结果；
-  到第 3 步会停下并告诉你该写什么。这是故意的——先看清数据长什么样，再动手建表。
+【读回时的坑（实测确认）】
+  pd.read_csv("data.csv") 默认会把 id 列推断成 int64：
+      "001" → 1   ← 前导零没了
+  想让 id 保持 "001" 这种字符串，必须显式指定：
+      pd.read_csv("data.csv", dtype={"id": str})
+  后续 main.py 如果要靠 id 反查 corpus/001.txt，这条是必须的。
+
+【怎么跑都对：路径与 cwd 无关】
+  脚本用 __file__ 推出自己的绝对路径，所以从任何目录启动都能找到 corpus/。
+  在 C:\\Users\\QQ229 这种上级目录下运行，也不会再报"没有 txt 文件"。
+
+  ★ 上面那行写成双反斜杠是必须的，别改成单个。
+    Python 普通字符串里，反斜杠 + 大写 U 是 Unicode 转义的开始，
+    后面跟不了合法编码就直接 SyntaxError（这个坑写这段注释时刚踩了一次）。
+    要写 Windows 路径，三个办法任选：
+        "C:\\\\Users\\\\xxx"   转义
+        r"C:\\Users\\xxx"    前面加 r 变原始字符串（推荐）
+        用 / 代替： "C:/Users/xxx"
 """
 
 import glob      # 用来按通配符找文件：glob("corpus/*.txt")
@@ -61,21 +78,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CORPUS_DIR = os.path.join(BASE_DIR, "corpus")     # 语料目录（绝对路径）
 OUT_CSV = os.path.join(BASE_DIR, "data.csv")      # 输出文件（绝对路径）
 MIN_CHARS = 500                # 正文最少多少字才算合格，太短的丢掉
-
-
-def TODO_未实现(说明: str):
-    """
-    占位函数。这不是给你用的，是给"还没写完"的地方用的。
-
-    好处：比写 `pass` 或 `___` 强得多——
-      ① 一跑到这里就报错，不会静悄悄地算出一个错结果
-      ② 报错信息直接告诉你该写什么，不用回头翻注释
-      ③ 不会像下划线占位符那样被误读（`_2_` 在 Python 里居然是个合法变量名）
-    """
-    raise NotImplementedError(
-        "\n\n还没填的 TODO：\n  " + 说明 + "\n\n"
-        "把整段 TODO_未实现(...) 换成提示的代码，然后再跑一次。\n"
-    )
 
 
 # ============================================================
@@ -146,11 +148,7 @@ def build_dataframe(rows: list[dict]) -> pd.DataFrame:
       df = pd.DataFrame(rows)          ← 就一行
       return df
     """
-    df = pd.DataFrame(rows) 
-    return df
-    df = TODO_未实现(
-        "TODO 1：用 pd.DataFrame(rows) 把字典列表转成表格，然后 return df"
-    )
+    df = pd.DataFrame(rows)
     return df
 
 
@@ -182,10 +180,6 @@ def add_char_count(df: pd.DataFrame) -> pd.DataFrame:
     """
     df["chars"] = df["content"].str.len()
     return df
-    TODO_未实现(
-        "TODO 2：给 df 新增一列 chars，用 df['content'].str.len() 算每篇字数"
-    )
-    return df
 
 
 # ============================================================
@@ -204,11 +198,8 @@ def report(df: pd.DataFrame) -> None:
     为什么值得先看 shape：如果 id/title/content 解析错位，这里立刻就露馅
     （比如 10 行变成 20 行，说明 split 切错了）。
     """
-    TODO_未实现(
-        "TODO 3：打印 df.shape、df.head(3)、以及字数的最小/最大/平均值"
-    )
-    print(df.shape)      
-    print(df.head(3))     
+    print(df.shape)
+    print(df.head(3))
     print(df["chars"].min(), df["chars"].max(), df["chars"].mean())
 
 
@@ -237,9 +228,6 @@ def save_csv(df: pd.DataFrame, path: str) -> None:
 
       sep 默认是逗号，这里不用管。
     """
-    TODO_未实现(
-        "TODO 4：用 df.to_csv(path, index=False, encoding='utf-8-sig') 写文件"
-    )
     df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
