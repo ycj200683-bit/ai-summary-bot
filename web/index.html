@@ -107,6 +107,10 @@
         <option value="3" selected>3 句话</option>
         <option value="5">5 句话</option>
       </select>
+      <select id="engine" title="用哪条链路生成">
+        <option value="own" selected>我的 Key</option>
+        <option value="cloud">云服务</option>
+      </select>
       <button class="primary" id="go">生成摘要</button>
     </div>
   </div>
@@ -121,7 +125,7 @@
   </div>
 
   <footer>
-    <span class="dot"></span>摘要由云服务大模型生成 · 调用记录存于云端数据库<br>
+    <span class="dot"></span>默认走我自己的百炼 Key（Python 后端），可切到云服务大模型 · 调用记录存于云端数据库<br>
     接口文档见 <a href="/docs">/docs</a> · 健康检查 <a href="/api/health">/api/health</a>
   </footer>
 </div>
@@ -235,11 +239,64 @@ async function takeQuota() {
 }
 
 /* ============================================================
+ * 6) 自己那条链路：调 Python 后端的 /api/summarize
+ *    后端用的是 .env 里配置的百炼 key（我自己的账户、自己的额度）。
+ *    ★ 这里不再调 takeQuota()：/api/summarize 服务端内部已经记账一次，
+ *      前端再调一次就是一次请求扣两次额度。
+ * ============================================================ */
+async function callOwnBackend(text, sentences) {
+  const resp = await fetch("/api/summarize", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: text, length: sentences })
+  });
+
+  let data = null;
+  try {
+    data = await resp.json();
+  } catch (_) { /* 后端 5xx 时可能是纯文本，解析失败就按空处理 */ }
+
+  if (!resp.ok) {
+    const detail = (data && data.detail) || ("HTTP " + resp.status);
+    const err = new Error(detail);
+    err.httpStatus = resp.status;    // 让 describeError 能按状态码说人话
+    throw err;
+  }
+  if (!data || typeof data.summary !== "string") {
+    throw new Error("后端返回格式不对（没拿到 summary 字段）");
+  }
+  return data;
+}
+
+/* ============================================================
+ * 6.1) 统一写库：两条链路都记一笔元数据
+ *      只存字数/耗时/模型名，不存正文也不存摘要内容。
+ *      owner_id 一律不传（库里有 DEFAULT auth.uid()）。
+ * ============================================================ */
+async function recordStats(row) {
+  if (!cloud) return;                // 云服务没起来也不能影响摘要本身
+  try {
+    const { error } = await cloud.database.from("summary_stats").insert(row);
+    if (error) console.warn("记录写入失败", error);
+  } catch (e) {
+    console.warn("记录写入失败", e);
+  }
+}
+
+/* ============================================================
  * 6) 错误提示：按 error.code 前缀给不同的人话
  * ============================================================ */
 function describeError(e) {
   const code = (e && e.error && e.error.code) || "";
   const msg = (e && e.error && e.error.message) || (e && e.message) || String(e);
+
+  // 自有 Key 那条链路抛的是 HTTP 状态码，先按码说人话
+  const hs = e && e.httpStatus;
+  if (hs === 429) return "额度用完了：" + msg;
+  if (hs === 503) return "后端没配好（多半是没设 API_KEY）：" + msg;
+  if (hs === 502) return "上游模型服务不稳定，稍等再点一次：" + msg;
+  if (hs === 422) return "请求格式不对（正文长度要在 1~5000 字）：" + msg;
+
   if (code.indexOf("auth_") === 0) return "云服务鉴权没通过（可能是当前域名不在白名单里）：" + code;
   if (code.indexOf("quota_") === 0) return "平台额度已用完或限流，稍后再试：" + code;
   if (code.indexOf("request_") === 0) return "请求参数或模型不匹配：" + msg;
@@ -257,9 +314,11 @@ async function doSummarize() {
   const out = $("out"), body = $("body"), status = $("status");
   const btn = $("go");
 
+  // 引擎：own = Python 后端（我自己的百炼 key）；cloud = 云服务大模型
+  let engine = $("engine").value === "cloud" ? "cloud" : "own";
+
   if (!text) { alert("先贴点内容"); return; }
   if (text.length > MAX) { alert("超过 5000 字了，删短一点"); return; }
-  if (!cloud) { showBanner("云服务尚未就绪，请刷新页面。"); return; }
 
   btn.disabled = true;
   btn.textContent = "生成中…";
@@ -269,68 +328,81 @@ async function doSummarize() {
   status.textContent = "生成中";
   $("latency").textContent = "";
   $("model").textContent = "";
+  $("banner").classList.remove("show");
 
+  // 云服务 SDK 没加载上（CDN 挂了、断网、企业网拦截）时自动回退，
+  // 而不是把用户挡在门外——自有 Key 这条路不依赖任何外部脚本。
+  if (engine === "cloud" && !cloud) {
+    engine = "own";
+    showBanner("云服务 SDK 没能加载，本次自动改用「我的 Key」链路。");
+  }
+
+  const sentences = [2, 3, 5].includes(parseInt($("len").value, 10))
+    ? parseInt($("len").value, 10) : 3;
   const started = performance.now();
 
+  let answer = "";
+  let costMs = 0;
+  let modelUsed = "";
+
   try {
-    // ① 服务端额度闸门
-    await takeQuota();
+    if (engine === "own") {
+      /* ---------- 链路 A：Python 后端 + 我自己的 key ---------- */
+      // 不走 takeQuota()：/api/summarize 服务端内部已经记一次额度
+      const data = await callOwnBackend(text, sentences);
+      answer = data.summary;
+      costMs = data.latency_ms;
+      modelUsed = data.model || "未知模型";
+      body.textContent = answer;      // 这条链路是整段返回，没有流式
+    } else {
+      /* ---------- 链路 B：云服务大模型（流式） ---------- */
+      await takeQuota();
 
-    // ② 选模型
-    const m = await getModel();
+      const m = await getModel();
+      modelUsed = m.id;
 
-    // ③ 流式调用云服务大模型
-    //   system 消息必须是应用自己写的固定内容，不能把用户输入拼进去
-    const sentences = [2, 3, 5].includes(parseInt($("len").value, 10))
-      ? parseInt($("len").value, 10) : 3;
+      // system 消息必须是应用自己写的固定内容，不能把用户输入拼进去
+      const stream = cloud.llm.chat.completions.create({
+        model: m.id,
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是一个简洁、准确的中文摘要助手。用不超过 " + sentences +
+              " 句话概括用户给出的内容，只输出摘要正文，不要加标题、不要用 Markdown 列表。"
+          },
+          { role: "user", content: text }
+        ],
+        stream: true,
+        temperature: 0.3,
+        stream_options: { include_usage: true }
+      });
 
-    let answer = "";
-    const stream = cloud.llm.chat.completions.create({
-      model: m.id,
-      messages: [
-        {
-          role: "system",
-          content:
-            "你是一个简洁、准确的中文摘要助手。用不超过 " + sentences +
-            " 句话概括用户给出的内容，只输出摘要正文，不要加标题、不要用 Markdown 列表。"
-        },
-        { role: "user", content: text }
-      ],
-      stream: true,
-      temperature: 0.3,
-      stream_options: { include_usage: true }
-    });
-
-    for await (const chunk of stream) {
-      const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
-      if (delta && delta.content) {
-        answer += delta.content;
-        body.textContent = answer;      // 边收边渲染
+      for await (const chunk of stream) {
+        const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
+        if (delta && delta.content) {
+          answer += delta.content;
+          body.textContent = answer;  // 边收边渲染
+        }
       }
+      costMs = Math.round(performance.now() - started);
     }
-
-    const costMs = Math.round(performance.now() - started);
 
     if (!answer.trim()) {
       throw new Error("模型没有返回内容，请重试");
     }
 
-    status.textContent = "摘要结果";
+    status.textContent = engine === "own" ? "摘要结果 · 自有 Key" : "摘要结果 · 云服务";
     $("latency").textContent = costMs + " ms · " + text.length + " 字";
-    $("model").textContent = m.id;
+    $("model").textContent = modelUsed;
 
-    // ④ 写入云端数据库（只存元数据，不存正文与摘要内容）
-    //    owner_id 一律不传：库里有 DEFAULT auth.uid()，未登录时就是 null
-    const { error } = await cloud.database.from("summary_stats").insert({
+    // 两条链路都记一笔到云端（只存元数据，不存正文与摘要内容）
+    await recordStats({
       input_chars: text.length,
       output_chars: answer.length,
       latency_ms: costMs,
-      model: m.id
+      model: modelUsed
     });
-    if (error) {
-      console.warn("记录写入失败", error);
-    }
-
     await refreshStats();
   } catch (e) {
     body.classList.add("err");
@@ -360,13 +432,20 @@ if (initCloud()) {
   refreshStats();
 }
 
-/* 临时自检钩子（验证完就删）：带 ?selftest=1 打开会自动跑一次完整流程 */
-if (location.search.indexOf("selftest=1") !== -1) {
+/* 临时自检钩子（验证完就删）
+ *   ?selftest=1      测「我的 Key」链路
+ *   ?selftest=cloud  测「云服务」链路
+ */
+if (location.search.indexOf("selftest=") !== -1) {
+  const which = location.search.indexOf("selftest=cloud") !== -1 ? "cloud" : "own";
+  $("engine").value = which;
   $("text").value = "青海大学位于西宁，是一所综合性大学。学校海拔较高，气候干燥，冬季寒冷。学校设有多个学院，计算机技术与应用学院是其中之一，注重实践能力培养。";
   doSummarize().then(function () {
     const d = document.createElement("div");
     d.id = "selftest-result";
-    d.textContent = "RESULT|" + $("status").textContent + "|" + $("body").textContent.replace(/\s+/g, " ").slice(0, 160) + "|" + $("latency").textContent + "|total=" + $("s-total").textContent;
+    d.textContent = "RESULT|engine=" + which + "|" + $("status").textContent + "|" +
+      $("body").textContent.replace(/\s+/g, " ").slice(0, 160) + "|" +
+      $("latency").textContent + "|" + $("model").textContent + "|total=" + $("s-total").textContent;
     document.body.appendChild(d);
   });
 }
