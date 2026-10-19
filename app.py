@@ -83,6 +83,9 @@ class SummarizeOut(BaseModel):
     latency_ms: int
     input_chars: int
     model: str
+    # 实际用了几句。正文太短时句数会被收窄，前端拿它跟用户选的对比，
+    # 才能给出"原文只有 69 字，按 2 句给出"这种说明，而不是让用户以为选择被无视。
+    sentences_used: int = 0
 
 
 # ============================================================
@@ -203,6 +206,7 @@ def summarize(payload: SummarizeIn, request: Request) -> SummarizeOut:
         latency_ms=cost_ms,
         input_chars=len(text),
         model=_model_name,
+        sentences_used=bot.sentences_used,
     )
 
 

@@ -56,6 +56,7 @@ pip install -r requirements-dev.txt      # 想跑测试再装这个
 API_KEY=你的key
 API_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 MODEL_NAME=deepseek-v4.1-flash
+DISABLE_THINKING=1
 ```
 
 `python main.py`、`python -m uvicorn app:app` 都会自己读它，不用每次开终端都 export 一遍。
@@ -75,6 +76,7 @@ export API_KEY="你的key"
 | `API_KEY` | **必填** | 无 | 服务商的 API Key。未设置时程序直接退出并提示（不会带着空 key 去白白请求一次） |
 | `API_BASE_URL` | 可选 | `https://api.deepseek.com/v1` | 服务地址。**写 base 或写完整 URL 都行**，代码会自动补 `/chat/completions`，结尾多打的斜杠和空格也会处理掉 |
 | `MODEL_NAME` | 可选 | `deepseek-chat` | 模型名。本项目当前用 `deepseek-v4.1-flash`（走百炼）；也可填 `deepseek-chat` / `qwen-plus` / `gpt-4o-mini` / `qwen2.5:7b` 等 |
+| `DISABLE_THINKING` | 可选 | 关 | 设成 `1` 关闭"深度思考"。摘要不需要推理，开着只是白等——同一篇 2320 字文章要 5 句：开思考 15.9 s，关思考 2.2 s。只对支持该参数的模型有效 |
 
 > 兼容旧配置：只设 `DEEPSEEK_API_KEY`（不含 `API_KEY`）也仍然能跑，不会因为升级就报错。
 >
@@ -159,6 +161,19 @@ python main.py --file sample.txt --length 5
 > 早期版本写的是「5 句话以内」——那是上限而不是目标，模型给 4 句也算完成任务，
 > 于是用户点「5 句」却拿到 4 句。现在改成目标句数，并在拿到结果后数一遍标点：
 > 不符就带着「你刚才写了 N 句」的纠正要求重写一次（只重试一次，避免成本翻倍）。
+>
+> **但"正好 N 句"不能无脑执行**：原文只有 69 个字却要 5 句，模型会把一句话劈成两句，
+> 出现「……气候干燥。冬季寒冷。」这种残句。所以句数按正文字数封顶：
+>
+> | 正文字数 | 最多几句 |
+> |---|---|
+> | < 200 | 2 |
+> | 200 ~ 599 | 3 |
+> | 600 ~ 1499 | 4 |
+> | ≥ 1500 | 5 |
+>
+> 收窄发生时，命令行会打一行 `📏 正文 69 字，5 句会拆碎，按 2 句生成`，
+> 网页会在结果标题后面注明「原文 69 字，按 2 句给出」，接口通过 `sentences_used` 返回实际句数。
 
 ### 示例 3：API 出错时
 
@@ -277,10 +292,10 @@ python -m pytest -q        # 想看每条用例的名字，加 -v
 ```
 tests\test_main.py ...............                                        [100%]
 
-============================= 18 passed in 0.11s ==============================
+============================= 23 passed in 0.12s ==============================
 ```
 
-18 条用例分四类：
+23 条用例分五类：
 
 | 类别 | 覆盖内容 |
 |---|---|

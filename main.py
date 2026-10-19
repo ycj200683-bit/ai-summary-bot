@@ -140,6 +140,7 @@ DEFAULT_MODEL = "deepseek-chat"
 ENV_API_KEY = "API_KEY"
 ENV_API_BASE_URL = "API_BASE_URL"
 ENV_MODEL_NAME = "MODEL_NAME"
+ENV_DISABLE_THINKING = "DISABLE_THINKING"
 
 # 旧的变量名继续认，避免老用户（其实就是你自己）改配置时炸掉
 LEGACY_ENV_API_KEY = "DEEPSEEK_API_KEY"
@@ -177,6 +178,11 @@ class Config:
     model: str = DEFAULT_MODEL
     temperature: float = 0.3                      # 越小越稳定、越大越发散
     timeout: int = 30                             # 超时秒数
+    # 关掉"深度思考"：摘要这类任务不需要推理，开了只是白等。
+    # 实测同一篇 2320 字文章、同样要 5 句：
+    #   开思考 15.9 秒（reasoning_tokens 1274） / 关思考 2.2 秒（无推理）——差 7 倍。
+    # 只对支持该参数的模型有效（如百炼的 DeepSeek/Qwen 混合思考模型），别的服务商多半忽略。
+    disable_thinking: bool = False
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -206,11 +212,18 @@ class Config:
         base_url = os.getenv(ENV_API_BASE_URL) or DEFAULT_API_URL
         model = os.getenv(ENV_MODEL_NAME) or DEFAULT_MODEL
 
+        # 开关型配置：只认 "1" / "true" / "yes" 这几种写法，
+        # 不能写成 type=bool 那种"字符串 False 也被当成真"的坑。
+        disable_thinking = (os.getenv(ENV_DISABLE_THINKING) or "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+
         # cls(...) 等价于 Config(...)，没传的参数用上面写的默认值
         return cls(
             api_key=key,
             api_url=normalize_api_url(base_url),
             model=model,
+            disable_thinking=disable_thinking,
         )
 
 
@@ -304,6 +317,11 @@ class LLMClient:
             "temperature": self.config.temperature,
         }
 
+        # 关掉深度思考：模型不用先"想一大段"再回答。
+        # 只在该开关打开时才加这个字段——不认识的字段有些服务商会直接 400。
+        if self.config.disable_thinking:
+            payload["enable_thinking"] = False
+
         try:
             resp = requests.post(
                 self.config.api_url,
@@ -363,12 +381,41 @@ def count_sentences(text: str) -> int:
     return sum(1 for ch in text if ch in SENTENCE_ENDS)
 
 
+def max_reasonable_sentences(n_chars: int) -> int:
+    """
+    按正文字数给一个"不把句子拆碎"的句数上限。
+
+    ★ 为什么需要它：
+      用户选了 5 句，但原文只有 69 个字，一共就 2~3 个要点。
+      硬凑 5 句的后果是把一句话劈成两句——实测出现过
+      「学校海拔较高，气候干燥。冬季寒冷。」这种残句。
+      这不是"满足需求"，是为了数字好看牺牲了可读性。
+
+    ★ 为什么按字数分档而不是按段落/要点数：
+      分档规则简单、能一眼验证、前后端都好实现（web 里要复制同一份规则）。
+      真正"数要点"得先做语义分析，对摘要这个量级的文本不划算。
+
+    ★ 改这里的阈值时，记得同步改 web/index.html 的 maxReasonableSentences()。
+      两边算出来不一致，就会出现"页面说 3 句、接口按 5 句做"的错位。
+    """
+    if n_chars < 200:
+        return 2
+    if n_chars < 600:
+        return 3
+    if n_chars < 1500:
+        return 4
+    return 5
+
+
 class Summarizer:
     """组合 LLMClient 完成'摘要'这件事。"""
 
     def __init__(self, client: LLMClient, max_sentences: int = 3):
         self.client = client        # 存一个"能发请求的工具"
         self.max_sentences = max_sentences
+        # 实际用了几句：用户要的句数经正文字数上限收窄之后的结果。
+        # 调用方（app.py）要把这个值告诉前端，否则用户会以为自己的选择被无视了。
+        self.sentences_used = max_sentences
 
     def _build_prompt(self, text: str) -> tuple[str, str]:
         """拼出 (系统提示词, 用户提示词)。下划线开头 = 内部用的方法。"""
@@ -376,10 +423,14 @@ class Summarizer:
         #   用户点的是"5 句话"，期待就是 5 句。"以内"是个上限，模型给 3 句也算
         #   完成任务——这不是模型不听话，是提示词本身就没要求写满。
         #   改成"正好 N 句"并给出可数的硬指标（几个句号），模型才有依据照做。
+        # ★ 用 sentences_used 而不是 max_sentences：
+        #   短文本的句数已经被 max_reasonable_sentences() 收窄过，
+        #   这里必须按收窄后的数字要求，否则又会去凑一个凑不出来的句数。
+        n = self.sentences_used
         system = (
             f"你是一个简洁、准确的中文摘要助手。"
-            f"请写正好 {self.max_sentences} 句话概括要点："
-            f"每句话只讲一个要点，每句话都以句号结尾，全文一共 {self.max_sentences} 个句号；"
+            f"请写正好 {n} 句话概括要点："
+            f"每句话只讲一个要点，每句话都以句号结尾，全文一共 {n} 个句号；"
             f"不要合并句子，不要分点，不要加标题。"
         )
         user = f"请简要总结以下内容：\n{text}"
@@ -391,20 +442,28 @@ class Summarizer:
         提示词是"请求"，不是"契约"——模型仍有概率少写或合并句子。
         所以这里做一次句数校验，不符就带着纠正要求重写一次（只重试一次，避免成本失控）。
         """
+        # 先按正文字数收窄句数：用户要 5 句但原文只有 69 字时，硬写 5 句会把句子拆碎。
+        self.sentences_used = min(self.max_sentences, max_reasonable_sentences(len(text)))
+        if self.sentences_used != self.max_sentences:
+            logger.info(
+                "📏 正文 %d 字，%d 句会拆碎，按 %d 句生成（你要求的是 %d 句）",
+                len(text), self.max_sentences, self.sentences_used, self.max_sentences,
+            )
+
         system, user = self._build_prompt(text)
         result = self.client.chat(system, user)
 
         got = count_sentences(result)
-        if got == self.max_sentences:
+        if got == self.sentences_used:
             return result
 
         logger.warning(
             "✍️ 句数不符：要求 %d 句，实际 %d 句 → 带纠正要求重写一次",
-            self.max_sentences, got,
+            self.sentences_used, got,
         )
         fix = (
-            f"你刚才写的不是 {self.max_sentences} 句（是 {got} 句）。"
-            f"请重写：必须正好 {self.max_sentences} 句话，每句话以句号结尾，"
+            f"你刚才写的不是 {self.sentences_used} 句（是 {got} 句）。"
+            f"请重写：必须正好 {self.sentences_used} 句话，每句话以句号结尾，"
             f"只输出摘要正文，不要解释。"
         )
         return self.client.chat(system, user + "\n\n" + fix)

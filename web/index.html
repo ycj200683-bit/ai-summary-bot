@@ -340,6 +340,15 @@ function countSentences(s) {
   return m ? m.length : 0;
 }
 
+/* 按字数给句数上限——和 main.py 的 max_reasonable_sentences() 必须一致。
+ * 短文本硬凑 5 句会把一句劈成两句（"……气候干燥。冬季寒冷。"），读起来是残句。 */
+function maxReasonableSentences(n) {
+  if (n < 200) return 2;
+  if (n < 600) return 3;
+  if (n < 1500) return 4;
+  return 5;
+}
+
 /* ============================================================
  * 6) 错误提示：按 error.code 前缀给不同的人话
  * ============================================================ */
@@ -401,6 +410,7 @@ async function doSummarize() {
   let answer = "";
   let costMs = 0;
   let modelUsed = "";
+  let usedSentences = sentences;      // 实际用了几句（短文本会被收窄）
 
   try {
     if (engine === "own") {
@@ -410,6 +420,7 @@ async function doSummarize() {
       answer = data.summary;
       costMs = data.latency_ms;
       modelUsed = data.model || "未知模型";
+      usedSentences = data.sentences_used || sentences;   // 后端会告诉我们实际用了几句
       body.textContent = answer;      // 这条链路是整段返回，没有流式
     } else {
       /* ---------- 链路 B：云服务大模型（流式） ---------- */
@@ -418,23 +429,26 @@ async function doSummarize() {
       const m = await getModel();
       modelUsed = m.id;
 
+      // 和 main.py 的 max_reasonable_sentences() 保持同一套规则
+      usedSentences = Math.min(sentences, maxReasonableSentences(text.length));
+
       // system 消息必须是应用自己写的固定内容，不能把用户输入拼进去
       const system =
-        "你是一个简洁、准确的中文摘要助手。请写正好 " + sentences +
+        "你是一个简洁、准确的中文摘要助手。请写正好 " + usedSentences +
         " 句话概括用户给出的内容：每句话只讲一个要点，每句话都以句号结尾，" +
-        "全文一共 " + sentences + " 个句号；不要合并句子，不要分点，" +
+        "全文一共 " + usedSentences + " 个句号；不要合并句子，不要分点，" +
         "不要加标题，不要用 Markdown 列表。";
 
       answer = await streamOnce(m.id, system, text, body);
 
       // 提示词是"请求"不是"契约"：模型仍可能少写或把两句并成一句。
       // 句数不对就带纠正要求重写一次（只一次，避免积分翻倍）。
-      if (countSentences(answer) !== sentences) {
+      if (countSentences(answer) !== usedSentences) {
         const got = countSentences(answer);
         status.textContent = "句数不足，正在补齐…";
         const fix =
-          "你刚才写的不是 " + sentences + " 句（是 " + got + " 句）。" +
-          "请重写：必须正好 " + sentences + " 句话，每句话以句号结尾，" +
+          "你刚才写的不是 " + usedSentences + " 句（是 " + got + " 句）。" +
+          "请重写：必须正好 " + usedSentences + " 句话，每句话以句号结尾，" +
           "只输出摘要正文，不要解释。";
         answer = await streamOnce(m.id, system, text + "\n\n" + fix, body);
       }
@@ -445,7 +459,11 @@ async function doSummarize() {
       throw new Error("模型没有返回内容，请重试");
     }
 
-    status.textContent = engine === "own" ? "摘要结果 · 自有 Key" : "摘要结果 · 云服务";
+    const base = engine === "own" ? "摘要结果 · 自有 Key" : "摘要结果 · 云服务";
+    // 句数被收窄时要说清楚，否则用户会以为自己选的 4 句被无视了
+    status.textContent = usedSentences === sentences
+      ? base
+      : base + "（原文 " + text.length + " 字，按 " + usedSentences + " 句给出）";
     $("latency").textContent = costMs + " ms · " + text.length + " 字";
     $("model").textContent = modelUsed;
 

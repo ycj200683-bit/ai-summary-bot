@@ -331,7 +331,8 @@ def test_summarize_句数不符时只重写一次():
     fake = FakeClient()
     bot = Summarizer(fake, max_sentences=5)
 
-    assert bot.summarize("原文") == "一。二。三。四。五。"
+    # 用 2000 字的长文本：句数上限才是 5（短文本会被收窄，测不到"要 5 句"这条路）
+    assert bot.summarize("字" * 2000) == "一。二。三。四。五。"
     assert fake.calls == 2          # 只补一次，不会无限重试烧额度
 
 
@@ -347,5 +348,86 @@ def test_summarize_句数正确时不重复调用():
     fake = FakeClient()
     bot = Summarizer(fake, max_sentences=5)
 
-    bot.summarize("原文")
+    bot.summarize("字" * 2000)
     assert fake.calls == 1          # 一次就够，不做多余请求
+
+
+# ============================================================
+# 句数自适应（v1.4）：短文本硬凑 5 句会把一句劈成两句
+# ============================================================
+def test_max_reasonable_sentences_按字数分档():
+    assert main.max_reasonable_sentences(69) == 2
+    assert main.max_reasonable_sentences(199) == 2
+    assert main.max_reasonable_sentences(200) == 3
+    assert main.max_reasonable_sentences(600) == 4
+    assert main.max_reasonable_sentences(1500) == 5
+    assert main.max_reasonable_sentences(99999) == 5
+
+
+def test_summarize_短文本自动收窄句数并给出提示():
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+            self.system = ""
+
+        def chat(self, system, user):
+            self.calls += 1
+            self.system = system
+            return "一。二。"
+
+    fake = FakeClient()
+    bot = Summarizer(fake, max_sentences=5)
+
+    bot.summarize("很短的一段话。")      # 7 字 → 上限 2 句
+
+    assert bot.sentences_used == 2       # 实际只用 2 句
+    assert "正好 2 句" in fake.system     # 提示词跟着收窄，不会再去凑 5 句
+    assert fake.calls == 1               # 第一次就符合，不触发重写
+
+
+# ============================================================
+# 关思考开关（v1.4）：摘要是"提炼"不是"推理"，让模型先想一大段纯属白等
+#   实测同一篇 2320 字文章、同样要 5 句：
+#     开思考 15.9 s（reasoning_tokens 1274） / 关思考 2.2 s（无推理）
+# ============================================================
+def test_from_env_关思考开关默认关(clean_env):
+    clean_env.setenv("API_KEY", "sk-test")
+    assert Config.from_env().disable_thinking is False
+
+
+def test_from_env_关思考开关认多种写法(clean_env):
+    clean_env.setenv("API_KEY", "sk-test")
+    for value in ("1", "true", "TRUE", "yes", "on"):
+        clean_env.setenv("DISABLE_THINKING", value)
+        assert Config.from_env().disable_thinking is True, value
+
+    # 这些不该被当成"开"——尤其 "false" 是最容易踩的坑
+    for value in ("0", "false", "", "no"):
+        clean_env.setenv("DISABLE_THINKING", value)
+        assert Config.from_env().disable_thinking is False, value
+
+
+def test_chat_关思考时才带_enable_thinking_字段(clean_env, monkeypatch):
+    """不开开关就别往请求里塞 enable_thinking——有的服务商见到陌生字段直接 400。"""
+    seen = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"choices":[{"message":{"content":"摘要"}}]}'
+
+        def json(self):
+            return {"choices": [{"message": {"content": "摘要"}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        seen["payload"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+
+    # 关思考 → 带字段
+    LLMClient(Config(api_key="k", disable_thinking=True)).chat("sys", "user")
+    assert seen["payload"]["enable_thinking"] is False
+
+    # 默认 → 不带字段
+    LLMClient(Config(api_key="k")).chat("sys", "user")
+    assert "enable_thinking" not in seen["payload"]
