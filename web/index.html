@@ -58,6 +58,29 @@
   button.primary:active:not(:disabled) { transform: translateY(1px); }
   button.primary:disabled { background: #a5b4fc; cursor: not-allowed; }
 
+  /* 次要按钮：复制 / 填入示例。视觉上要明显比主按钮轻，
+     否则用户会以为页面上有三个"生成"按钮。 */
+  button.ghost {
+    padding: 6px 12px; font-size: 13px; font-weight: 600; font-family: inherit;
+    color: #4b5563; background: #fff; border: 1px solid #d1d5db;
+    border-radius: 8px; cursor: pointer; transition: background .15s, color .15s;
+  }
+  button.ghost:hover:not(:disabled) { background: #f3f4f6; color: #111827; }
+  button.ghost:disabled { opacity: .5; cursor: not-allowed; }
+  #copy { margin-left: auto; }
+
+  /* 纯文字按钮：塞在计数旁边，不占一排 */
+  button.link {
+    background: none; border: none; padding: 0; font: inherit;
+    font-size: 13px; color: #4f46e5; cursor: pointer;
+  }
+  button.link:hover { text-decoration: underline; }
+
+  .quota { font-size: 13px; color: #9ca3af; font-variant-numeric: tabular-nums; }
+  .quota.warn { color: #b45309; }
+  /* 给额度那行留固定高度：没拿到时也不会有跳动 */
+  .quota-line { text-align: right; margin: -4px 0 10px; min-height: 18px; }
+
   .out { margin-top: 20px; display: none; }
   .out.show { display: block; }
   .out-head {
@@ -94,20 +117,24 @@
 
   <div class="stats">
     <div class="stat"><div class="k">累计生成</div><div class="v" id="s-total">—</div></div>
-    <div class="stat"><div class="k">平均耗时</div><div class="v" id="s-avg">—</div></div>
-    <div class="stat"><div class="k">今日调用</div><div class="v" id="s-today">—</div></div>
+    <!-- 平均值只取最近 200 条样本，标题里就说清，别让人以为是全量平均 -->
+    <div class="stat"><div class="k">近 200 次均耗时</div><div class="v" id="s-avg">—</div></div>
+    <div class="stat" title="同样只统计最近 200 条记录"><div class="k">今日调用</div><div class="v" id="s-today">—</div></div>
   </div>
 
+  <div class="quota-line"><span class="quota" id="quota"></span></div>
+
   <div class="card">
-    <textarea id="text" placeholder="把要摘要的正文粘在这里，例如一篇新闻报道、一段会议记录、一份论文摘要……"></textarea>
+    <textarea id="text" aria-label="要摘要的正文" placeholder="把要摘要的正文粘在这里，例如一篇新闻报道、一段会议记录、一份论文摘要……"></textarea>
     <div class="row">
       <span class="count" id="count">0 / 5000</span>
-      <select id="len">
+      <button class="link" id="sample" type="button" title="填一段示例正文，直接点生成就能看到效果">填入示例</button>
+      <select id="len" aria-label="摘要句数">
         <option value="2">2 句话</option>
         <option value="3" selected>3 句话</option>
         <option value="5">5 句话</option>
       </select>
-      <select id="engine" title="用哪条链路生成">
+      <select id="engine" aria-label="用哪条链路生成" title="用哪条链路生成">
         <option value="own" selected>我的 Key</option>
         <option value="cloud">云服务</option>
       </select>
@@ -117,21 +144,26 @@
 
   <div class="out" id="out">
     <div class="out-head">
-      <span id="status"></span>
+      <span id="status" role="status"></span>
       <span class="badge" id="latency"></span>
       <span class="badge" id="model"></span>
+      <button class="ghost" id="copy" type="button" hidden>复制</button>
     </div>
-    <div class="body" id="body"></div>
+    <div class="body" id="body" aria-live="polite"></div>
   </div>
 
   <footer>
-    <span class="dot"></span>默认走我自己的百炼 Key（Python 后端），可切到云服务大模型 · 调用记录存于云端数据库<br>
-    接口文档见 <a href="/docs">/docs</a> · 健康检查 <a href="/api/health">/api/health</a>
+    <span class="dot"></span>默认走 Python 后端 + 我自己的 DeepSeek Key，可切到云服务大模型 · 调用记录存于云端数据库<br>
+    接口文档见 <a href="/docs">/docs</a> · 健康检查 <a href="/api/health">/api/health</a> · Ctrl/⌘ + Enter 直接生成
   </footer>
 </div>
 
-<!-- 云服务 SDK（纯 HTML 项目用 CDN 形式，全局变量 WorkBuddyCloud） -->
-<script src="https://cdn.jsdelivr.net/npm/@tencent-ai/workbuddy-cloud-sdk@dev/lib/index.global.js"></script>
+<!-- 云服务 SDK（纯 HTML 项目用 CDN 形式，全局变量 WorkBuddyCloud）
+     ★ 版本号必须写死，不能用 @dev / @latest：
+       浮动标签会跟着上游发布自动变，某天一个 breaking change 推上来，
+       页面第二天就白屏，而且你本地什么都没改、查半天查不出来。
+       升级时手动改这个数字，改完自己点一遍。 -->
+<script src="https://cdn.jsdelivr.net/npm/@tencent-ai/workbuddy-cloud-sdk@0.1.4/lib/index.global.js"></script>
 <script>
 /* ============================================================
  * 1) 云服务配置
@@ -146,6 +178,27 @@ const PUBLIC_CONFIG = {
 
 const MAX = 5000;
 const $ = (id) => document.getElementById(id);
+
+/* ============================================================
+ * 超时与兜底
+ *   以前完全没有超时：后端卡住 / 网络半死时，fetch 永远不返回，
+ *   按钮一直是 disabled 的「生成中…」，用户只能刷新页面。
+ *   own 链路是整段返回（后端内部最多重试 3 次，正常 1~3 秒），60 秒够了；
+ *   云服务是流式，给 120 秒兜底。
+ * ============================================================ */
+const OWN_TIMEOUT_MS = 60000;
+const STREAM_WATCHDOG_MS = 120000;
+
+/* 示例正文：新用户打开是空框，不知道该贴什么，往往直接关掉。
+   这段 280 字左右，按 maxReasonableSentences() 正好落在「3 句」档。 */
+const SAMPLE_TEXT =
+  "近日，工业和信息化部发布《关于加快推进人工智能产业创新发展的指导意见》，" +
+  "提出到 2027 年建成一批人工智能创新应用先导区。意见明确，要支持大模型在制造、医疗、" +
+  "教育等重点行业落地，鼓励企业与高校共建联合实验室，推动算力资源统筹调度和开放共享。" +
+  "在数据要素方面，将探索建立高质量语料库分级分类管理制度，健全数据确权、流通和收益分配机制。" +
+  "针对当前行业普遍反映的算力成本高、场景验证难等问题，意见提出设立专项资金、" +
+  "建设公共服务平台等具体举措，并鼓励地方结合实际出台配套政策。" +
+  "多位业内人士认为，此次文件更强调应用落地和生态协同，有望降低中小企业使用人工智能的门槛。";
 
 let cloud = null;
 let model = null;
@@ -250,16 +303,32 @@ async function refreshStats() {
 
 /* ============================================================
  * 5) 额度检查：仍然走 Python 后端（服务端限流比前端可靠）
+ *    返回剩余次数，前端用来说"今天还剩 N 次"。
  * ============================================================ */
 async function takeQuota() {
   const resp = await fetch("/api/quota/take", { method: "POST" });
-  if (resp.ok) return;
+  if (resp.ok) {
+    let j = null;
+    try {
+      j = await resp.json();
+    } catch (_) { /* 解析失败时当作"剩余未知"，不影响本次调用 */ }
+    return j && typeof j.remaining === "number" ? j.remaining : -1;
+  }
   let detail = "今天的额度已用完";
   try {
     const j = await resp.json();
     if (j && j.detail) detail = j.detail;
   } catch (_) { /* 忽略解析失败 */ }
   throw new Error(detail);
+}
+
+/* 把"今天还剩几次"显示出来。
+   拿不到就别显示——宁可不显示，也不要摆一个猜出来的数字在那里。 */
+function showQuota(remaining) {
+  if (typeof remaining !== "number" || remaining < 0) return;
+  const el = $("quota");
+  el.textContent = "今日剩余 " + remaining + " 次";
+  el.classList.toggle("warn", remaining <= 3);   // 快用完时变色提醒
 }
 
 /* ============================================================
@@ -269,11 +338,29 @@ async function takeQuota() {
  *      前端再调一次就是一次请求扣两次额度。
  * ============================================================ */
 async function callOwnBackend(text, sentences) {
-  const resp = await fetch("/api/summarize", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text: text, length: sentences })
-  });
+  /* 带超时的 fetch：AbortController 到点就掐断请求，
+     否则网络半死时这个 await 永远不返回，界面就一直转圈。 */
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), OWN_TIMEOUT_MS);
+
+  let resp;
+  try {
+    resp = await fetch("/api/summarize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text, length: sentences }),
+      signal: ctrl.signal
+    });
+  } catch (e) {
+    // 主动 abort 时浏览器抛 AbortError，翻成人话；
+    // 其余（断网、后端没起）统一归为"连不上"
+    if (e && e.name === "AbortError") {
+      throw new Error("等了 " + Math.round(OWN_TIMEOUT_MS / 1000) + " 秒还没返回，已自动放弃，请再点一次");
+    }
+    throw new Error("连不上后端（" + ((e && e.message) || "网络错误") + "）");
+  } finally {
+    clearTimeout(timer);
+  }
 
   let data = null;
   try {
@@ -311,7 +398,7 @@ async function recordStats(row) {
  * 6.2) 流式调用一次，边收边渲染，返回完整文本
  *      抽出来是因为"句数不对要重写"会调第二次——不抽出来就得复制一遍循环。
  * ============================================================ */
-async function streamOnce(modelId, system, userText, bodyEl) {
+async function streamOnce(modelId, system, userText, bodyEl, state) {
   let acc = "";
   const stream = cloud.llm.chat.completions.create({
     model: modelId,
@@ -325,6 +412,10 @@ async function streamOnce(modelId, system, userText, bodyEl) {
   });
 
   for await (const chunk of stream) {
+    // 上层已经放弃（看门狗超时 / 用户重新点了一次）：
+    // 立刻停手，别再往页面上写——否则旧结果会把新的报错盖掉。
+    if (state && state.cancelled) return acc;
+
     const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
     if (delta && delta.content) {
       acc += delta.content;
@@ -398,17 +489,28 @@ function describeError(e) {
 /* ============================================================
  * 7) 主流程
  * ============================================================ */
+
+/* 上一次生成的完整答案，给「复制」按钮用 */
+let lastAnswer = "";
+/* 请求序号：每点一次生成 +1。
+   慢请求晚回来时靠它判断"我是不是已经被新的一次取代了"，
+   否则旧结果会盖掉新结果——特别是流式，边收边写最明显。 */
+let runSeq = 0;
+
 async function doSummarize() {
   const ta = $("text");
   const text = ta.value.trim();
   const out = $("out"), body = $("body"), status = $("status");
   const btn = $("go");
 
-  // 引擎：own = Python 后端（我自己的百炼 key）；cloud = 云服务大模型
+  // 引擎：own = Python 后端（我自己的 DeepSeek key）；cloud = 云服务大模型
   let engine = $("engine").value === "cloud" ? "cloud" : "own";
 
   if (!text) { alert("先贴点内容"); return; }
-  if (text.length > MAX) { alert("超过 5000 字了，删短一点"); return; }
+  if (text.length > MAX) { alert("超过 " + MAX + " 字了，删短一点"); return; }
+
+  const mySeq = ++runSeq;
+  const state = { cancelled: false };   // 看门狗用它告诉流式循环"别写了"
 
   btn.disabled = true;
   btn.textContent = "生成中…";
@@ -419,6 +521,8 @@ async function doSummarize() {
   $("latency").textContent = "";
   $("model").textContent = "";
   $("banner").classList.remove("show");
+  $("copy").hidden = true;
+  lastAnswer = "";
 
   // 云服务 SDK 没加载上（CDN 挂了、断网、企业网拦截）时自动回退，
   // 而不是把用户挡在门外——自有 Key 这条路不依赖任何外部脚本。
@@ -436,19 +540,35 @@ async function doSummarize() {
   let modelUsed = "";
   let usedSentences = sentences;      // 实际用了几句（短文本会被收窄）
 
+  /* 看门狗：到点还没结束就把按钮放出来。
+     云服务 SDK 的流式没有暴露 abort，底层请求不一定能真掐断，
+     但至少用户不会被一个永远转圈的按钮困住；
+     旧流程靠 state.cancelled / mySeq 自我沉默，不会污染新结果。 */
+  const watchdog = setTimeout(() => {
+    if (mySeq !== runSeq) return;
+    state.cancelled = true;
+    status.textContent = "超过 " + Math.round(STREAM_WATCHDOG_MS / 1000) + " 秒还没结束，已解除等待";
+    btn.disabled = false;
+    btn.textContent = "生成摘要";
+  }, STREAM_WATCHDOG_MS);
+
   try {
     if (engine === "own") {
       /* ---------- 链路 A：Python 后端 + 我自己的 key ---------- */
       // 不走 takeQuota()：/api/summarize 服务端内部已经记一次额度
       const data = await callOwnBackend(text, sentences);
+      if (mySeq !== runSeq) return;      // 已被新的一次请求取代，结果作废
+
       answer = data.summary;
       costMs = data.latency_ms;
       modelUsed = data.model || "未知模型";
       usedSentences = data.sentences_used || sentences;   // 后端会告诉我们实际用了几句
       body.textContent = answer;      // 这条链路是整段返回，没有流式
+      showQuota(data.remaining);
     } else {
       /* ---------- 链路 B：云服务大模型（流式） ---------- */
-      await takeQuota();
+      showQuota(await takeQuota());
+      if (mySeq !== runSeq) return;
 
       const m = await getModel();
       modelUsed = m.id;
@@ -463,7 +583,8 @@ async function doSummarize() {
         "全文一共 " + usedSentences + " 个句号；不要合并句子，不要分点，" +
         "不要加标题，不要用 Markdown 列表。";
 
-      answer = normalizeSummary(await streamOnce(m.id, system, text, body));
+      answer = normalizeSummary(await streamOnce(m.id, system, text, body, state));
+      if (mySeq !== runSeq) return;
       body.textContent = answer;    // 规整后再渲染，避免中间闪一下带列表符的版本
 
       // 提示词是"请求"不是"契约"：模型仍可能少写或把两句并成一句。
@@ -475,7 +596,8 @@ async function doSummarize() {
           "你刚才写的不是 " + usedSentences + " 句（是 " + got + " 句）。" +
           "请重写：必须正好 " + usedSentences + " 句话，每句话以句号结尾，" +
           "只输出摘要正文，不要解释。";
-        answer = normalizeSummary(await streamOnce(m.id, system, text + "\n\n" + fix, body));
+        answer = normalizeSummary(await streamOnce(m.id, system, text + "\n\n" + fix, body, state));
+        if (mySeq !== runSeq) return;
         body.textContent = answer;
       }
       costMs = Math.round(performance.now() - started);
@@ -493,6 +615,10 @@ async function doSummarize() {
     $("latency").textContent = costMs + " ms · " + text.length + " 字";
     $("model").textContent = modelUsed;
 
+    // 有结果了才亮出复制按钮
+    lastAnswer = answer;
+    $("copy").hidden = false;
+
     // 两条链路都记一笔到云端（只存元数据，不存正文与摘要内容）
     await recordStats({
       input_chars: text.length,
@@ -502,15 +628,46 @@ async function doSummarize() {
     });
     await refreshStats();
   } catch (e) {
+    if (mySeq !== runSeq) return;        // 过期请求的错误别干扰新请求
     body.classList.add("err");
     body.textContent = describeError(e);
     status.textContent = "出错了";
     $("latency").textContent = "";
     $("model").textContent = "";
   } finally {
-    btn.disabled = false;
-    btn.textContent = "生成摘要";
+    clearTimeout(watchdog);
+    if (mySeq === runSeq) {              // 正常收尾；被取代的请求不许改按钮状态
+      btn.disabled = false;
+      btn.textContent = "生成摘要";
+    }
   }
+}
+
+/* ============================================================
+ * 7.1) 复制结果
+ *   摘要页最高频的动作就是"复制走"，没有这个按钮，
+ *   用户只能手动选中一长段文字。
+ * ============================================================ */
+async function copyAnswer() {
+  if (!lastAnswer) return;
+  const btn = $("copy");
+
+  try {
+    await navigator.clipboard.writeText(lastAnswer);
+  } catch (_) {
+    // 非 https 环境或老浏览器没有 clipboard API，退回老办法
+    const tmp = document.createElement("textarea");
+    tmp.value = lastAnswer;
+    tmp.style.position = "fixed";
+    tmp.style.opacity = "0";
+    document.body.appendChild(tmp);
+    tmp.select();
+    try { document.execCommand("copy"); } catch (_) { /* 实在不行就算了 */ }
+    document.body.removeChild(tmp);
+  }
+
+  btn.textContent = "已复制";
+  setTimeout(() => { btn.textContent = "复制"; }, 1400);
 }
 
 /* ============================================================
@@ -523,6 +680,26 @@ $("text").addEventListener("input", () => {
 });
 
 $("go").addEventListener("click", doSummarize);
+
+/* Ctrl / ⌘ + Enter 直接生成：
+   贴完长文手还在键盘上，不用再去够鼠标。生成中就别重复触发。 */
+$("text").addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+    e.preventDefault();
+    if (!$("go").disabled) doSummarize();
+  }
+});
+
+/* 填入示例：顺手派发 input 事件，字数计数才会跟着变；
+   否则用户会看到"填了字但计数还是 0 / 5000"。 */
+$("sample").addEventListener("click", () => {
+  const ta = $("text");
+  ta.value = SAMPLE_TEXT;
+  ta.dispatchEvent(new Event("input"));
+  ta.focus();
+});
+
+$("copy").addEventListener("click", copyAnswer);
 
 // 页面就绪后初始化并拉一次统计
 if (initCloud()) {
