@@ -234,7 +234,7 @@ python -m uvicorn app:app --reload --port 8000
 |---|---|---|
 | `GET` | `/` | 网页界面（`web/index.html`，前后端物理分开） |
 | `GET` | `/api/health` | 健康检查：返回模型名、是否已配置、限额 |
-| `POST` | `/api/summarize` | 单条摘要（**主链路**，走自己的百炼 key） |
+| `POST` | `/api/summarize` | 单条摘要（**主链路**，走自己的模型 key，当前 DeepSeek） |
 | `POST` | `/api/quota/take` | 取一次额度（云服务链路调用前先来这里记账） |
 
 请求示例：
@@ -250,16 +250,22 @@ curl -X POST http://127.0.0.1:8000/api/summarize \
   "summary": "……",
   "latency_ms": 1988,
   "input_chars": 127,
-  "model": "deepseek-v4.1-flash"
+  "model": "deepseek-v4.1-flash",
+  "sentences_used": 3,
+  "remaining": 19
 }
 ```
+
+`sentences_used` 是实际用了几句（正文太短会被收窄）；`remaining` 是这个 IP 今天还剩几次，页面右上角就显示它。
 
 ### 两条生成链路（页面上可切换）
 
 | 链路 | 走哪里 | 花谁的额度 | 特点 |
 |---|---|---|---|
-| **我的 Key**（默认） | 浏览器 → `POST /api/summarize` → 自己的百炼 key | 自己的 | 成本可控、额度自己说了算；不依赖任何外部脚本，最快 |
+| **我的 Key**（默认） | 浏览器 → `POST /api/summarize` → 自己的模型 key | 自己的 | 成本可控、额度自己说了算；不依赖任何外部脚本，最快 |
 | 云服务 | 浏览器 → 云服务 SDK → 平台大模型（流式） | 平台的 | 边收边渲染；但要多加载一个 CDN 脚本，网络不好时可能加载失败 |
+
+> CDN 引的是**写死的版本号**（`@0.1.4`），不是 `@dev` / `@latest`。浮动标签会跟着上游发布自动变，某天一个 breaking change 推上来页面就白屏，而你本地什么都没改、查半天查不出来。升级时手动改数字，改完自己点一遍。
 
 设计要点：
 
@@ -272,16 +278,92 @@ curl -X POST http://127.0.0.1:8000/api/summarize \
 | 决定 | 原因 |
 |---|---|
 | **不用 `Config.from_env()` 直接初始化** | 它在没配 key 时会 `raise SystemExit`。命令行里这是"程序退出"，在服务里会把整个进程带崩。改成惰性创建 + 返回 503，服务能启动、能说清原因 |
-| **每个 IP 每天 20 次** | 公开部署后，背后是真金白银的 API 账单。不限流的话，一个脚本就能把额度刷光 |
+| **每个 IP 每天 20 次 + 全站每天 300 次** | 公开部署后，背后是真金白银的 API 账单。不限流的话，一个脚本就能把额度刷光。单 IP 限额能换 IP 绕过，所以再加一道全站闸门 |
 | **Pydantic 做入参校验** | `text` 限 1~5000 字、`length` 限 1~5，超了自动返回 422，不用自己写 if |
 
-> 注意：限流用的是进程内存，重启即清零。生产环境应该放 Redis——这是下一阶段的事。
+关于限流的三条坑（都已处理，写在代码注释里）：
+
+| 坑 | 处理 |
+|---|---|
+| **先扣费再校验** | 纯空白正文（`" "`）能通过 `min_length=1`，以前会被扣一次额度再返回 400。现在先 `strip()` 校验、再扣费 |
+| **`X-Forwarded-For` 可伪造** | 以前取第一段，换 25 个假 IP 能绕过 20 次限额。现在：直连来源是公网 IP 就完全不信 XFF；是内网/回环（说明前面有反代）才取**最后一段**——最后一段是最近一跳代理追加的，客户端改不了 |
+| **计数存在进程内存** | 重启清零；`--workers N` 时每进程各记一份，全站上限变成 N 倍。要多进程就先换 Redis |
+| **账本只增不减 + 并发穿透** | `_usage` 每天清一次过期 IP，否则 IP 越攒越多；`check_quota()` 整段加锁，否则并发时"读-判断-写"不是原子的，20 个请求同时到可能全都放行 |
+
+> `/api/health` 会返回 `quota_scope: "process-memory"`，部署时一眼能看到当前实例的计数口径。
+
+---
+
+## 怎么给别人用
+
+`uvicorn app:app` 默认只绑 `127.0.0.1`，**只有本机能开**。要让别人访问，看你要给谁用：
+
+| 场景 | 用什么 | 成本 | 代价 |
+|---|---|---|---|
+| 同一个 WiFi / 校园网（同学、室友、面试现场） | `python share.py` | 0 | 对方必须在同一个网络 |
+| 发给不在一个网络的人（微信发个链接） | `python share.py --tunnel` | 0 | 链接临时，你电脑不能关 |
+| 想长期挂着一个地址 | 云服务器 / Render / Railway | 有免费档 | 要配环境变量、可能休眠 |
+
+### 一、局域网（最快，5 秒）
+
+```bash
+python share.py
+```
+
+脚本会打印两个地址：
+
+```
+你自己打开：       http://127.0.0.1:8000
+同一个 WiFi 的人：  http://10.160.220.105:8000     ← 把这个发出去
+```
+
+> 内网 IP 每换一次网络就会变（家里 / 宿舍 / 教室各不同），所以必须现查——脚本用 UDP `connect` 让系统挑一块能出网的网卡，比 `socket.gethostbyname(gethostname())` 靠谱（后者在装了 VirtualBox 的机器上经常返回虚拟网卡地址）。
+
+第一次启动 Windows 会弹「是否允许 Python 访问网络」，必须点**允许**，否则别人能连上但页面打不开。
+
+### 二、公网临时链接（发微信就能用）
+
+```bash
+python share.py --tunnel
+```
+
+多出来一行：
+
+```
+公网链接（谁都能开）： https://illustrated-rss-assembled-encoding.trycloudflare.com
+```
+
+走的是 Cloudflare 快速隧道（cloudflared），不用公网 IP、不用域名、不用注册账号，HTTPS 也是自动的。没装的话：`winget install --id Cloudflare.cloudflared`。
+
+三个必须知道的限制：
+
+1. **关掉就失效**，重启会换一个新地址——它不是永久部署。
+2. **电脑睡眠 / 断网就断**，因为服务跑在你自己机器上。
+3. **新域名下「云服务」链路和顶部统计会失效**：云端只认白名单里的域名，别家的 Origin 一律拒绝（浏览器报 `Failed to fetch`）。主链路「我的 Key」不受影响，页面也会自动把云服务选项标灰。要用云服务链路，得去云服务后台把新域名加进白名单。
+
+### 三、长期部署
+
+项目已经按部署平台的要求写好了：`app.py` 从 `PORT` 环境变量读端口、绑 `0.0.0.0`、`.env` 不在仓库里。以 Render / Railway 为例：
+
+| 配置项 | 值 |
+|---|---|
+| 构建命令 | `pip install -r requirements-web.txt` |
+| 启动命令 | `uvicorn app:app --host 0.0.0.0 --port $PORT` |
+| 环境变量 | `API_KEY`（必填）、`API_BASE_URL`、`MODEL_NAME` |
+
+`API_KEY` 必须在平台的环境变量里单独配——仓库里没有 `.env`（被 `.gitignore` 拦住了），这是故意的。
+
+### 公开之前先想一件事
+
+**别人用的是你的 API 额度。** 目前的口子是每 IP 每天 20 次 + 全站每天 300 次（`app.py` 顶部改）。按 `deepseek-v4.1-flash` 的价格，全站刷满一天也就是几毛钱，可接受；但如果你换成贵模型，先把 `MAX_CALLS_PER_DAY_GLOBAL` 调小再发链接。
+
+另外限流记录的是**进程内内存**：服务重启清零，`--workers N` 会失效成 N 倍。真要长期开放，先把账本换 Redis。
 
 ---
 
 ## 运行测试
 
-测试**不会真的调用 API**（不花钱、不联网、结果稳定）：用 `monkeypatch` 把 `requests.post` 换成假函数，人为造出 200 / 401 / 429 各种响应。
+测试**不会真的调用 API**（不花钱、不联网、结果稳定）：用 `monkeypatch` 把 `requests.post` 换成假函数，人为造出 200 / 401 / 429 各种响应；Web 层则把 `Summarizer` 换成固定返回的替身。
 
 ```bash
 python -m pytest -q        # 想看每条用例的名字，加 -v
@@ -290,10 +372,14 @@ python -m pytest -q        # 想看每条用例的名字，加 -v
 预期输出：
 
 ```
-tests\test_main.py ...............                                        [100%]
+tests\test_app.py ..............                                          [ 33%]
+tests\test_main.py ............................                          [100%]
 
-============================= 28 passed in 0.12s ==============================
+============================= 42 passed in 0.47s ==============================
 ```
+
+- `tests/test_main.py`：摘要内核。重试策略、句数收窄、排版规整、配置解析。
+- `tests/test_app.py`：HTTP 壳。限流、扣费时机、真实 IP 判定、响应字段。这一层以前没有测试，所以「伪造 XFF 绕过限额」「空白正文白扣额度」两个问题上线时都没被发现。
 
 28 条用例分六类：
 
@@ -314,16 +400,21 @@ ai-summary-bot/
 ├── main.py                  # 主程序：Config / LLMClient / Summarizer 三个类
 ├── batch.py                 # 批量模式：读表 → 逐行摘要 → 断点续跑 → 写表
 ├── app.py                   # Web 服务：FastAPI 外壳 + 单页前端
+├── share.py                 # 一键分享：绑 0.0.0.0 + 打印内网 IP（可选公网隧道）
+├── web/
+│   └── index.html           # 单页前端：两条链路、流式渲染、复制、快捷键
 ├── build_corpus.py          # 数据准备：corpus/*.txt → data.csv
 ├── fetch_corpus.py          # 语料采集：从公开接口补够 30 篇（带节流与清洗）
 ├── sample.txt               # 示例文本
 ├── requirements.txt         # 运行依赖
+├── requirements-web.txt     # Web 服务依赖（不含 pandas，部署更快）
 ├── requirements-dev.txt     # 开发依赖（pytest）
 ├── pytest.ini               # pytest 配置（pythonpath / testpaths）
 ├── pyrightconfig.json       # 类型检查配置（让 IDE 认识 import main）
 ├── conftest.py              # 把项目根加进 sys.path
 ├── tests/
-│   ├── test_main.py         # 28 个单元测试
+│   ├── test_main.py         # 28 个单元测试：摘要内核
+│   ├── test_app.py          # 14 个用例：限流、扣费时机、真实 IP 判定
 │   └── README.md            # 测试写法讲解
 ├── corpus/                  # 语料 30 篇（有版权，已 gitignore）
 │   ├── 001~030.txt          # 标题 + 空行 + 正文
@@ -424,12 +515,14 @@ return cls(api_key=key, api_url=normalize_api_url(base_url), model=model)
 ## 已知限制 / 后续计划
 
 - [x] ~~只支持 DeepSeek 一家~~ → v0.5 已支持任意 OpenAI 兼容服务
+- [x] ~~尚无 Web 界面~~ → v2.0 已上线：FastAPI + `web/index.html`，支持两条链路、流式渲染、云端统计
+- [x] ~~只支持单文件~~ → v1.1 已支持批量 CSV（`batch.py`，断点续跑）
+- [x] ~~调用记录只落日志~~ → v2.0 起元数据同时写入云端表 `summary_stats`（字数/耗时/模型名，不存正文）
 - [ ] 不校验 `API_KEY` 的长度/格式，填错了要靠 API 返回 401 才发现
-- [ ] 目前只支持单文件；计划支持批量处理 CSV（每行一次摘要）→ **v1.1**
 - [ ] 主流程没有 `--model` 命令行参数，换模型得改环境变量（README 里写了怎么换）
-- [ ] 调用记录只落日志文件，尚未入库；计划落 MySQL 以便统计（成功率、平均耗时、token 消耗）→ **v1.3**
+- [ ] 限流账本在进程内存里，多 worker 部署会各记一份；下一步换 Redis
+- [ ] 统计条的平均耗时/今日次数只取最近 200 条样本，记录多了会有偏差；下一步改成服务端聚合
 - [ ] 只有一套 prompt；计划做两套方案对比评测并产出数据报告 → **v2.1**
-- [ ] 尚无 Web 界面
 
 ---
 

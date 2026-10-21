@@ -21,3 +21,7 @@ out*.csv
 get-pip.py
 _page.png
 page.html
+_e2e.mjs
+
+# 本地项目数据（记忆、任务状态），不入库
+.workbuddy/
