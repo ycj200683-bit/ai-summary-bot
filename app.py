@@ -16,17 +16,28 @@ app.py —— 把 ai_summary_bot 变成一个 Web 服务（FastAPI）
   这就是分层的意义：换入口（CLI → HTTP）不用动内核。
 
 【启动】
-  PowerShell:
-    $env:API_KEY = $env:DASHSCOPE_API_KEY
-    $env:API_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    $env:MODEL_NAME = "qwen-plus"
-    python -m uvicorn app:app --reload --port 8000
+  python -m uvicorn app:app --reload --port 8000
+
+  密钥和模型名不用在 shell 里 export：同目录的 .env 由 main.load_dotenv() 读，
+  CLI 和 Web 共用同一份配置（当前默认 deepseek-v4.1-flash）。
+  要临时覆盖就在启动前设环境变量——load_dotenv 用 setdefault，
+  真实环境变量优先级高于 .env 文件。
 
   浏览器打开 http://127.0.0.1:8000        网页
                  http://127.0.0.1:8000/docs 自动生成的 API 文档
+
+【部署：限流的两个坑，别踩】
+  ① 反代后取真实 IP：见 client_ip()。默认只在「直连来源是内网/回环」时
+     才信 X-Forwarded-For，且只取最后一段（客户端自己塞的左边几段一律丢弃）。
+     代理在另一台机器上、直连来源是公网 IP 时，设 TRUST_PROXY=1 显式启用。
+  ② 计数存在进程内存里：uvicorn 默认单进程，够用；
+     一旦加 --workers N，每个进程各记一份，全站上限就变成 N 倍。
+     要多进程就先把 _usage/_global 换成 Redis。
 """
 
+import ipaddress
 import os
+import threading
 import time
 from datetime import date
 
@@ -86,6 +97,9 @@ class SummarizeOut(BaseModel):
     # 实际用了几句。正文太短时句数会被收窄，前端拿它跟用户选的对比，
     # 才能给出"原文只有 69 字，按 2 句给出"这种说明，而不是让用户以为选择被无视。
     sentences_used: int = 0
+    # 本次用掉之后这个 IP 今天还剩几次。前端显示出来，
+    # 用户才不会在第 20 次被 429 时才突然发现"原来有额度"。
+    remaining: int = -1         # -1 = 未知（老客户端/未走限流）
 
 
 # ============================================================
@@ -116,12 +130,66 @@ def get_client() -> LLMClient:
     return _client
 
 
+# 强制信任 X-Forwarded-For（代理在另一台机器上、直连来源是公网 IP 时才需要）
+TRUST_PROXY = (os.getenv("TRUST_PROXY") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# 视为"前面有反代"的来源地址段。
+# ★ 为什么不用 ipaddress 自带的 is_private：
+#   它把 203.0.113.0/24、198.51.100.0/24、192.0.2.0/24 这些 IANA 文档/保留段也算 private，
+#   用保留段做测试时会得到反直觉的结果。这里只列真正"内网"的段，语义明确。
+_INTERNAL_NETS = (
+    ipaddress.ip_network("127.0.0.0/8"),        # 回环（同机 nginx 反代）
+    ipaddress.ip_network("10.0.0.0/8"),         # 私有网段 / 容器网络
+    ipaddress.ip_network("172.16.0.0/12"),      # 私有网段
+    ipaddress.ip_network("192.168.0.0/16"),     # 私有网段
+    ipaddress.ip_network("169.254.0.0/16"),     # link-local
+    ipaddress.ip_network("100.64.0.0/10"),      # 云厂商内网 / 运营商 CGNAT
+    ipaddress.ip_network("::1/128"),            # IPv6 回环
+    ipaddress.ip_network("fc00::/7"),           # IPv6 唯一本地地址
+)
+
+
+def _is_internal_host(host: str) -> bool:
+    """直连来源是不是内网/回环地址。是 → 说明我们前面挂着代理，XFF 才有意义。"""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # 不是 IP 字面量（比如 TestClient 塞进来的 "testclient"），当作不可信来源
+        return False
+
+    # 双栈场景下客户端可能报成 ::ffff:127.0.0.1 这种 IPv4-mapped 地址
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+
+    # 版本不同不能直接 in（IPv4 地址对 IPv6 网段比较会抛 TypeError）
+    return any(ip.version == net.version and ip in net for net in _INTERNAL_NETS)
+
+
 def client_ip(request: Request) -> str:
-    """取客户端 IP。部署到反向代理后面时，真实 IP 在 X-Forwarded-For 里。"""
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """
+    取客户端 IP。
+
+    ★ 为什么不能直接用 X-Forwarded-For 的第一段（以前的写法，是个真漏洞）：
+      XFF 是客户端也能随便发的请求头。以前的代码取第一段，
+      攻击者每次换一个假 IP 发一次，单 IP 限额就形同虚设。
+      实测：伪造 25 个不同 IP 各发 1 次，全部放行。
+
+    现在的判定顺序：
+      ① 直连来源是公网 IP（或被强制 TRUST_PROXY）→ 用它，XFF 一律不看
+      ② 直连来源是内网/回环（说明前面有反代）→ 取 XFF 的【最后一段】。
+         最后一段是离我们最近的那跳代理追加的，客户端伪造不了；
+         客户端自己塞在左边的值全部丢弃。
+    """
+    peer = request.client.host if request.client else "unknown"
+
+    if TRUST_PROXY or _is_internal_host(peer):
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            return forwarded.split(",")[-1].strip() or peer
+
+    return peer
 
 
 # IP -> [日期, 已用次数]。进程内存里的简陋限流，重启即清零。
@@ -129,35 +197,59 @@ def client_ip(request: Request) -> str:
 _usage: dict[str, list] = {}
 _global: list = ["", 0]      # [日期, 全站已用次数]
 
+# ★ 为什么要加锁：FastAPI 的同步端点跑在线程池里，多个请求会真的并发进来。
+#   "先读再写"不是原子操作，20 个请求同时到、都读到 19，最后一个都没拦住。
+#   一把粗锁就够——临界区只有几行算术，不会成为瓶颈。
+_quota_lock = threading.Lock()
+_swept_on: list = [""]       # 上次清理过期 IP 记录的日期
+
+
+def _sweep_locked(today: str) -> None:
+    """
+    删掉非今天的 IP 记录。
+
+    ★ 不做清会怎样：_usage 只增不减，IP 越攒越多，进程内存慢慢涨上去。
+      一天清一次就够，成本是 O(IP 数)，而每个请求都要走这里——
+      所以用 _swept_on 记一下"今天清过了"，不要每次都扫。
+    """
+    stale = [k for k, v in _usage.items() if v[0] != today]
+    for k in stale:
+        del _usage[k]
+
 
 def check_quota(ip: str) -> int:
-    """用掉一次额度，返回剩余次数。超限抛 429。"""
+    """用掉一次额度，返回剩余次数。超限抛 429。整个读取-判断-写入都在锁里。"""
     today = date.today().isoformat()
 
-    # 第一道闸：全站总量
-    if _global[0] != today:
-        _global[0], _global[1] = today, 0
-    if _global[1] >= MAX_CALLS_PER_DAY_GLOBAL:
-        raise HTTPException(
-            status_code=429,
-            detail="今天的全站额度已用完，明天再来（这是个免费演示服务，额度有限）",
-        )
+    with _quota_lock:
+        if _swept_on[0] != today:
+            _sweep_locked(today)
+            _swept_on[0] = today
 
-    # 第二道闸：单个 IP
-    rec = _usage.get(ip)
-    if not rec or rec[0] != today:
-        _usage[ip] = [today, 1]
+        # 第一道闸：全站总量
+        if _global[0] != today:
+            _global[0], _global[1] = today, 0
+        if _global[1] >= MAX_CALLS_PER_DAY_GLOBAL:
+            raise HTTPException(
+                status_code=429,
+                detail="今天的全站额度已用完，明天再来（这是个免费演示服务，额度有限）",
+            )
+
+        # 第二道闸：单个 IP
+        rec = _usage.get(ip)
+        if not rec or rec[0] != today:
+            _usage[ip] = [today, 1]
+            _global[1] += 1
+            return MAX_CALLS_PER_DAY - 1
+
+        if rec[1] >= MAX_CALLS_PER_DAY:
+            raise HTTPException(
+                status_code=429,
+                detail=f"今天的 {MAX_CALLS_PER_DAY} 次额度已用完，明天再来",
+            )
+        rec[1] += 1
         _global[1] += 1
-        return MAX_CALLS_PER_DAY - 1
-
-    if rec[1] >= MAX_CALLS_PER_DAY:
-        raise HTTPException(
-            status_code=429,
-            detail=f"今天的 {MAX_CALLS_PER_DAY} 次额度已用完，明天再来",
-        )
-    rec[1] += 1
-    _global[1] += 1
-    return MAX_CALLS_PER_DAY - rec[1]
+        return MAX_CALLS_PER_DAY - rec[1]
 
 
 # ============================================================
@@ -177,17 +269,25 @@ def health() -> dict:
         "max_calls_per_day": MAX_CALLS_PER_DAY,
         "max_calls_per_day_global": MAX_CALLS_PER_DAY_GLOBAL,
         "used_today_global": _global[1] if _global[0] == date.today().isoformat() else 0,
+        # 限额记在进程内存里：单进程部署才是准的，多 worker 会各记一份（上限 ×N）。
+        # 把它显式暴露出来，部署时一眼能看到"我这个实例的计数口径是什么"。
+        "quota_scope": "process-memory",
+        "trust_proxy": TRUST_PROXY,
     }
 
 
 @app.post("/api/summarize", response_model=SummarizeOut)
 def summarize(payload: SummarizeIn, request: Request) -> SummarizeOut:
     """单条摘要。核心逻辑全部复用 main.py 里已经测过的 Summarizer。"""
-    check_quota(client_ip(request))
-
+    # ★ 顺序很重要：先校验、后扣费。
+    #   Pydantic 的 min_length=1 拦不住 " " 这种纯空白，
+    #   以前的代码先 check_quota() 再 strip()，导致每次空白请求白扣一次额度
+    #   （实测 25 次空白 → 400 ×25，但全站计数 0 → 25）。
     text = payload.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="正文不能是空白")
+
+    remaining = check_quota(client_ip(request))
 
     bot = Summarizer(get_client(), max_sentences=payload.length)
 
@@ -207,11 +307,28 @@ def summarize(payload: SummarizeIn, request: Request) -> SummarizeOut:
         input_chars=len(text),
         model=_model_name,
         sentences_used=bot.sentences_used,
+        remaining=remaining,
     )
 
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 INDEX_FILE = os.path.join(WEB_DIR, "index.html")
+
+# 页面按 mtime 缓存：以前每个请求都 open() 一次磁盘（实测 3.4ms），
+# 页面又不会变，纯属白读。但也不能读一次就永久缓存——
+# 改了 index.html 却要重启服务才生效，调试时很难受。
+# 折中：记住上次读到的 mtime，一样就直接用缓存。
+_index_cache: dict = {"mtime": None, "body": ""}
+
+
+def read_index() -> str:
+    """读 web/index.html，文件没变就走内存缓存。"""
+    mtime = os.path.getmtime(INDEX_FILE)
+    if _index_cache["mtime"] != mtime:
+        with open(INDEX_FILE, "r", encoding="utf-8") as f:
+            _index_cache["body"] = f.read()
+        _index_cache["mtime"] = mtime
+    return _index_cache["body"]
 
 
 @app.post("/api/quota/take")
@@ -239,8 +356,7 @@ def index():
       （前面那几次三引号事故就是教训）。物理分开，各自好改。
     """
     try:
-        with open(INDEX_FILE, "r", encoding="utf-8") as f:
-            return f.read()
+        return read_index()
     except FileNotFoundError:
         return HTMLResponse(
             "<h1>web/index.html 找不到</h1><p>前端文件没有跟着部署包一起上传。</p>",
