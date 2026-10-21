@@ -184,6 +184,34 @@ def test_private_peer_uses_last_xff_hop():
     assert app_module.client_ip(req) == "198.51.100.7"
 
 
+def test_private_peer_skips_trailing_proxy_hop():
+    """
+    Render / 部分 nginx 会把「代理自己的内网地址」追加在 XFF 末尾。
+    直接取最后一段 → 所有用户共用一个 IP → 20 次/天被几十个人分完。
+    正确做法：从右往左跳过内网地址，取第一个公网地址。
+    """
+    req = make_request("10.1.1.1", xff="203.0.113.5, 10.1.1.1")
+    assert app_module.client_ip(req) == "203.0.113.5"
+
+
+def test_private_peer_skips_multiple_proxy_hops():
+    # 多级代理：客户端 + 两层内网代理，仍要拿到最前面的公网地址
+    req = make_request("127.0.0.1", xff="203.0.113.5, 10.0.0.2, 172.16.0.9")
+    assert app_module.client_ip(req) == "203.0.113.5"
+
+
+def test_all_internal_xff_falls_back_to_rightmost():
+    # 整条链路都是内网（本机调试 / 容器互访）→ 退回最右一跳，至少能区分来源
+    req = make_request("127.0.0.1", xff="10.0.0.2, 192.168.1.7")
+    assert app_module.client_ip(req) == "192.168.1.7"
+
+
+def test_non_ip_xff_is_ignored():
+    # 伪造的不是 IP 字面量时不能被当成"公网地址"返回
+    req = make_request("10.1.1.1", xff="not-an-ip, 203.0.113.5")
+    assert app_module.client_ip(req) == "203.0.113.5"
+
+
 def test_private_peer_without_xff_falls_back_to_peer():
     req = make_request("127.0.0.1")
     assert app_module.client_ip(req) == "127.0.0.1"

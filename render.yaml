@@ -1,0 +1,43 @@
+# Render Blueprint —— 在 Render 上一键部署这个服务
+#
+# 怎么用：
+#   1. 把本文件推到 GitHub（已在仓库根目录）
+#   2. Render 控制台 → New → Blueprint → 选这个仓库
+#   3. 它会读这个文件自动建服务，并让你填 API_KEY（唯一需要手填的项）
+#
+# 为什么用 Blueprint 而不是在网页上逐项点：
+#   部署配置和代码放在一起，改了就跟着走。换台机器、重新建一个环境，
+#   点一次就行，不用凭记忆填 5 个环境变量——手填最容易漏，也最容易填错。
+
+services:
+  - type: web
+    name: ai-summary-bot            # 会变成 ai-summary-bot.onrender.com（名字被占用就改这里）
+    runtime: python
+    plan: free                      # 免费档：15 分钟没流量会休眠，下次访问冷启动约 50 秒
+    region: singapore               # 离国内最近的一档
+    branch: main
+    buildCommand: pip install -r requirements-web.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health    # app.py 里已经有这个接口，Render 靠它判断服务活没活
+    autoDeploy: true                # 推代码即自动重新部署
+
+    envVars:
+      # ★ API_KEY 不要写值：sync: false 表示"部署时让用户手填"。
+      #   写进这个文件就等于把密钥推到了 GitHub，一推送就公开。
+      - key: API_KEY
+        sync: false
+
+      # 下面三个和本地 .env 保持一致：阿里云百炼的 OpenAI 兼容端点 + deepseek-v4.1-flash
+      # 换厂商时只改这三行，不用动代码
+      - key: API_BASE_URL
+        value: https://dashscope.aliyuncs.com/compatible-mode/v1
+      - key: MODEL_NAME
+        value: deepseek-v4.1-flash
+      - key: DISABLE_THINKING
+        value: "1"                    # 摘要不需要推理链，关掉约快 7 倍
+
+      # 显式固定 Python 小版本：Render 的默认版本会随时间变，
+      # 不锁的话某天突然换版本，可能因为依赖没轮到 wheel 而构建失败。
+      # 若渲染报"版本不存在"，去 https://render.com/docs/python-version 换成列出的可用版本
+      - key: PYTHON_VERSION
+        value: "3.13.4"

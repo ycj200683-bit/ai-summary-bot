@@ -167,6 +167,15 @@ def _is_internal_host(host: str) -> bool:
     return any(ip.version == net.version and ip in net for net in _INTERNAL_NETS)
 
 
+def _is_ip(host: str) -> bool:
+    """是不是 IP 字面量。用来把伪造的垃圾串挡在 XFF 解析外面。"""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
 def client_ip(request: Request) -> str:
     """
     取客户端 IP。
@@ -177,17 +186,32 @@ def client_ip(request: Request) -> str:
       实测：伪造 25 个不同 IP 各发 1 次，全部放行。
 
     现在的判定顺序：
-      ① 直连来源是公网 IP（或被强制 TRUST_PROXY）→ 用它，XFF 一律不看
-      ② 直连来源是内网/回环（说明前面有反代）→ 取 XFF 的【最后一段】。
-         最后一段是离我们最近的那跳代理追加的，客户端伪造不了；
-         客户端自己塞在左边的值全部丢弃。
+      ① 直连来源是公网 IP（且没开 TRUST_PROXY）→ 用它，XFF 一律不看
+      ② 直连来源是内网/回环（说明前面有反代）→ 从 XFF 右边往左找
+         第一个【公网】地址
+
+    ★ 为什么是"从右往左找公网地址"，而不是直接取最后一段：
+      XFF 是从客户端往服务端一路追加的，最左边是客户端自称的（可伪造），
+      最右边是最近一跳代理追加的。但最近一跳代理追加的可能是它自己的内网地址
+      ——Render、部分 nginx 配置都会这么干。直接取最后一段，
+      结果就是"所有用户共用一个 IP"，20 次/天的限额被几十个人瞬间分完。
+      所以跳过尾部的内网地址，取第一个公网地址；客户端伪造的公网 IP
+      在左边，永远排在被代理追加的真实地址前面，取不到。
     """
     peer = request.client.host if request.client else "unknown"
 
     if TRUST_PROXY or _is_internal_host(peer):
         forwarded = request.headers.get("x-forwarded-for", "")
         if forwarded:
-            return forwarded.split(",")[-1].strip() or peer
+            hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+
+            for hop in reversed(hops):
+                if _is_ip(hop) and not _is_internal_host(hop):
+                    return hop
+
+            # 整条链路都是内网地址（本机调试、容器内网互访）→ 退回最右一跳
+            if hops:
+                return hops[-1]
 
     return peer
 

@@ -153,7 +153,7 @@
   </div>
 
   <footer>
-    <span class="dot"></span>默认走 Python 后端 + 我自己的 DeepSeek Key，可切到云服务大模型 · 调用记录存于云端数据库<br>
+    <span class="dot"></span>默认走 Python 后端 + 我自己的百炼 Key（deepseek-v4.1-flash），可切到云服务大模型 · 调用记录存于云端数据库<br>
     接口文档见 <a href="/docs">/docs</a> · 健康检查 <a href="/api/health">/api/health</a> · Ctrl/⌘ + Enter 直接生成
   </footer>
 </div>
@@ -503,7 +503,7 @@ async function doSummarize() {
   const out = $("out"), body = $("body"), status = $("status");
   const btn = $("go");
 
-  // 引擎：own = Python 后端（我自己的 DeepSeek key）；cloud = 云服务大模型
+  // 引擎：own = Python 后端（我自己的百炼 key）；cloud = 云服务大模型
   let engine = $("engine").value === "cloud" ? "cloud" : "own";
 
   if (!text) { alert("先贴点内容"); return; }

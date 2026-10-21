@@ -234,7 +234,7 @@ python -m uvicorn app:app --reload --port 8000
 |---|---|---|
 | `GET` | `/` | 网页界面（`web/index.html`，前后端物理分开） |
 | `GET` | `/api/health` | 健康检查：返回模型名、是否已配置、限额 |
-| `POST` | `/api/summarize` | 单条摘要（**主链路**，走自己的模型 key，当前 DeepSeek） |
+| `POST` | `/api/summarize` | 单条摘要（**主链路**，走自己的模型 key：百炼 · `deepseek-v4.1-flash`） |
 | `POST` | `/api/quota/take` | 取一次额度（云服务链路调用前先来这里记账） |
 
 请求示例：
@@ -341,17 +341,37 @@ python share.py --tunnel
 2. **电脑睡眠 / 断网就断**，因为服务跑在你自己机器上。
 3. **新域名下「云服务」链路和顶部统计会失效**：云端只认白名单里的域名，别家的 Origin 一律拒绝（浏览器报 `Failed to fetch`）。主链路「我的 Key」不受影响，页面也会自动把云服务选项标灰。要用云服务链路，得去云服务后台把新域名加进白名单。
 
-### 三、长期部署
+### 三、长期部署（Render）
 
-项目已经按部署平台的要求写好了：`app.py` 从 `PORT` 环境变量读端口、绑 `0.0.0.0`、`.env` 不在仓库里。以 Render / Railway 为例：
+仓库根目录已经有 `render.yaml`（Blueprint），配置和代码放在一起，不用在网页上凭记忆填环境变量。
 
-| 配置项 | 值 |
+**步骤**
+
+1. Render 控制台 → **New → Blueprint** → 选 GitHub 仓库 `ai-summary-bot`
+2. Render 读 `render.yaml` 自动建服务，只让你填 **`API_KEY`**（`sync: false` 的项）
+3. 等构建完成，拿到 `https://<服务名>.onrender.com`
+
+`API_KEY` 必须手填——仓库里没有 `.env`（被 `.gitignore` 拦住），`render.yaml` 里也只写了 `sync: false` 不写值。**密钥一旦写进仓库文件就等于公开**，这条没有例外。
+
+**免费档要知道的两件事**
+
+| 限制 | 影响 |
 |---|---|
-| 构建命令 | `pip install -r requirements-web.txt` |
-| 启动命令 | `uvicorn app:app --host 0.0.0.0 --port $PORT` |
-| 环境变量 | `API_KEY`（必填）、`API_BASE_URL`、`MODEL_NAME` |
+| 15 分钟没流量就休眠 | 休眠后第一次访问要等 **约 50 秒** 冷启动。面试前先自己访问一次把它叫醒 |
+| 实例 IP 共享、内存 512 MB | 够跑这个服务；但限流账本在进程内存里，重启清零 |
 
-`API_KEY` 必须在平台的环境变量里单独配——仓库里没有 `.env`（被 `.gitignore` 拦住了），这是故意的。
+**只改 `render.yaml` 里这三行就能换厂商：**
+
+```yaml
+- key: API_BASE_URL
+  value: https://dashscope.aliyuncs.com/compatible-mode/v1
+- key: MODEL_NAME
+  value: deepseek-v4.1-flash
+- key: DISABLE_THINKING
+  value: "1"
+```
+
+**Render 后面取真实 IP 的细节**：Render 是反向代理，`request.client.host` 拿到的是内网地址。`client_ip()` 会自动识别"来源是内网 → 说明有反代"，然后**从 X-Forwarded-For 右边往左找第一个公网地址**。之所以不是直接取最后一段：Render 会把代理自己的内网地址追加在末尾，直接取最后一段会让所有访客算成同一个 IP，20 次/天的限额被几十个人瞬间分完。这条逻辑有 8 个单测覆盖（公网来源忽略 XFF、跳过尾部代理、多级代理、全内网兜底、伪造非 IP 串、`TRUST_PROXY` 强制）。
 
 ### 公开之前先想一件事
 
@@ -372,14 +392,14 @@ python -m pytest -q        # 想看每条用例的名字，加 -v
 预期输出：
 
 ```
-tests\test_app.py ..............                                          [ 33%]
+tests\test_app.py ..................                                      [ 39%]
 tests\test_main.py ............................                          [100%]
 
-============================= 42 passed in 0.47s ==============================
+============================= 46 passed in 0.73s ==============================
 ```
 
 - `tests/test_main.py`：摘要内核。重试策略、句数收窄、排版规整、配置解析。
-- `tests/test_app.py`：HTTP 壳。限流、扣费时机、真实 IP 判定、响应字段。这一层以前没有测试，所以「伪造 XFF 绕过限额」「空白正文白扣额度」两个问题上线时都没被发现。
+- `tests/test_app.py`：HTTP 壳。限流、扣费时机、真实 IP 判定（含多级代理 XFF）、响应字段。这一层以前没有测试，所以「伪造 XFF 绕过限额」「空白正文白扣额度」两个问题上线时都没被发现。
 
 28 条用例分六类：
 
@@ -403,6 +423,7 @@ ai-summary-bot/
 ├── share.py                 # 一键分享：绑 0.0.0.0 + 打印内网 IP（可选公网隧道）
 ├── web/
 │   └── index.html           # 单页前端：两条链路、流式渲染、复制、快捷键
+├── render.yaml              # Render 部署配置（Blueprint，一键建服务）
 ├── build_corpus.py          # 数据准备：corpus/*.txt → data.csv
 ├── fetch_corpus.py          # 语料采集：从公开接口补够 30 篇（带节流与清洗）
 ├── sample.txt               # 示例文本
@@ -414,7 +435,7 @@ ai-summary-bot/
 ├── conftest.py              # 把项目根加进 sys.path
 ├── tests/
 │   ├── test_main.py         # 28 个单元测试：摘要内核
-│   ├── test_app.py          # 14 个用例：限流、扣费时机、真实 IP 判定
+│   ├── test_app.py          # 18 个用例：限流、扣费时机、真实 IP 判定
 │   └── README.md            # 测试写法讲解
 ├── corpus/                  # 语料 30 篇（有版权，已 gitignore）
 │   ├── 001~030.txt          # 标题 + 空行 + 正文
