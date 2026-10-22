@@ -300,9 +300,10 @@ curl -X POST http://127.0.0.1:8000/api/summarize \
 
 | 场景 | 用什么 | 成本 | 代价 |
 |---|---|---|---|
+| **有自己的域名（最推荐）** | `python share.py --named` | 0 | 电脑要开着；地址永久不变 |
 | 同一个 WiFi / 校园网（同学、室友、面试现场） | `python share.py` | 0 | 对方必须在同一个网络 |
-| 发给不在一个网络的人（微信发个链接） | `python share.py --tunnel` | 0 | 链接临时，你电脑不能关 |
-| 想长期挂着一个地址 | 云服务器 / Render / Railway | 有免费档 | 要配环境变量、可能休眠 |
+| 临时发个链接给人看一眼 | `python share.py --tunnel` | 0 | 地址每次变，你电脑不能关 |
+| 不想靠自己的电脑 | 云服务器 / Render / Railway | 有免费档 | 要配环境变量、可能休眠 |
 
 ### 一、局域网（最快，5 秒）
 
@@ -317,11 +318,61 @@ python share.py
 同一个 WiFi 的人：  http://10.160.220.105:8000     ← 把这个发出去
 ```
 
-> 内网 IP 每换一次网络就会变（家里 / 宿舍 / 教室各不同），所以必须现查——脚本用 UDP `connect` 让系统挑一块能出网的网卡，比 `socket.gethostbyname(gethostname())` 靠谱（后者在装了 VirtualBox 的机器上经常返回虚拟网卡地址）。
+> 内网 IP 每换一次网络就会变（家里 / 宿舍 / 教室各不同），所以必须现查。查法有讲究：
+> 只靠「连一下外网看系统选哪块网卡」在开了 **Clash / V2Ray 的 TUN 模式**时会返回 `198.18.0.1`（fake-IP 网关），
+> 在装了 **VirtualBox** 的机器上会返回 `192.168.56.1`（Host-Only 网卡）——这两个地址别人都连不上。
+> 现在改成先枚举本机所有 IPv4，排除虚拟网段（`198.18.0.0/15`、`192.168.56.0/24`、`172.17.0.0/16`、`169.254.0.0/16`），
+> 再从剩下的 RFC1918 私网地址里挑，拿不到才退回原来的方法。
 
 第一次启动 Windows 会弹「是否允许 Python 访问网络」，必须点**允许**，否则别人能连上但页面打不开。
 
-### 二、公网临时链接（发微信就能用）
+### 二、固定域名（Cloudflare Tunnel，推荐）
+
+有自己的域名时用这个：地址永久不变，写进简历、发给面试官都行。
+
+```bash
+python share.py --named
+```
+
+```
+  AI 摘要服务已启动（端口 8001）
+
+  你自己打开：       http://127.0.0.1:8001
+  同一个 WiFi 的人：  http://10.160.220.105:8001
+  固定域名：         https://ai.example.com
+       ↳ 地址永久不变；电脑睡眠 / 断网会断，醒来重跑这条命令即可
+```
+
+**一次性配置**（只做一次，之后每次只要上面那条命令）：
+
+```bash
+# 1. 登录（会打开浏览器，选你的域名授权）
+cloudflared tunnel login
+
+# 2. 建隧道
+cloudflared tunnel create ai-summary
+
+# 3. 在 ~/.cloudflared/config.yml 里写 ingress 规则，把域名指到本地端口
+#    tunnel / credentials-file 填第 2 步给你的隧道名和 uuid
+#    ingress:
+#      - hostname: ai.example.com
+#        service: http://127.0.0.1:8001
+#      - service: http_status:404
+
+# 4. 建 DNS 记录（CNAME → <uuid>.cfargotunnel.com，自动开橙云）
+cloudflared tunnel route dns ai-summary ai.example.com
+```
+
+配置写完 `python share.py --named` 会自动从 `config.yml` 里读出映射到当前端口的域名并打印，不用手记。
+
+几个要点：
+
+- **端口别用 8000**：`--named` 默认 8001。同一个隧道可以挂多个域名（各指不同端口），但两个服务用同一个端口，先起的那个会把端口占死（`[Errno 10048]`）。
+- **一个隧道挂多个域名**是标准做法，加服务就在 `ingress` 里加一条 `hostname`，不用再建隧道、不用多跑一个进程。
+- **橙云是正常的**：`route dns` 建出来的记录默认走 Cloudflare 代理（橙云），HTTPS 由 CF 提供，隧道后端无所谓。
+- **关机 / 睡眠就断**，重跑命令即可，域名不用改。
+
+### 三、公网临时链接（发微信就能用）
 
 ```bash
 python share.py --tunnel
@@ -333,15 +384,15 @@ python share.py --tunnel
 公网链接（谁都能开）： https://illustrated-rss-assembled-encoding.trycloudflare.com
 ```
 
-走的是 Cloudflare 快速隧道（cloudflared），不用公网 IP、不用域名、不用注册账号，HTTPS 也是自动的。没装的话：`winget install --id Cloudflare.cloudflared`。
+走的是 Cloudflare 快速隧道，不用公网 IP、不用域名、不用注册账号，HTTPS 也是自动的。没装 cloudflared 的话：`winget install --id Cloudflare.cloudflared`。
 
 三个必须知道的限制：
 
-1. **关掉就失效**，重启会换一个新地址——它不是永久部署。
+1. **关掉就失效**，重启会换一个新地址——它不是永久部署，只适合当场给人看一眼。
 2. **电脑睡眠 / 断网就断**，因为服务跑在你自己机器上。
 3. **新域名下「云服务」链路和顶部统计会失效**：云端只认白名单里的域名，别家的 Origin 一律拒绝（浏览器报 `Failed to fetch`）。主链路「我的 Key」不受影响，页面也会自动把云服务选项标灰。要用云服务链路，得去云服务后台把新域名加进白名单。
 
-### 三、长期部署（Render）
+### 四、长期部署（Render，可选）
 
 仓库根目录已经有 `render.yaml`（Blueprint），配置和代码放在一起，不用在网页上凭记忆填环境变量。
 
@@ -373,7 +424,10 @@ python share.py --tunnel
 
 **Render 后面取真实 IP 的细节**：Render 是反向代理，`request.client.host` 拿到的是内网地址。`client_ip()` 会自动识别"来源是内网 → 说明有反代"，然后**从 X-Forwarded-For 右边往左找第一个公网地址**。之所以不是直接取最后一段：Render 会把代理自己的内网地址追加在末尾，直接取最后一段会让所有访客算成同一个 IP，20 次/天的限额被几十个人瞬间分完。这条逻辑有 8 个单测覆盖（公网来源忽略 XFF、跳过尾部代理、多级代理、全内网兜底、伪造非 IP 串、`TRUST_PROXY` 强制）。
 
-### 四、绑自己的域名（Render + Cloudflare DNS）
+### 五、如果走 Render：给它绑自定义域名
+
+> 已经用第二节的 Cloudflare Tunnel 就不用看这节——隧道本身就是给域名用的，不存在"再绑一次"。
+> 这节只适用于「服务跑在 Render 上，想让域名指过去」的情况。
 
 有域名的话就别用 `onrender.com` 那个地址了——简历上和名片上都不好看，而且免费实例换服务名就变。
 
