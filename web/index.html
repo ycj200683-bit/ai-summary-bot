@@ -224,12 +224,16 @@ function initCloud() {
 /* 云服务 SDK 拿不到时，只把选项标灰——
  * 不要一进页面就弹黄色横幅：默认走「我的 Key」的人根本没用到云服务，
  * 那句"云服务加载失败"只会让他以为整个服务坏了。
+ *
+ * 换自定义域名后同一个函数还会被 refreshStats() 复用：
+ * 云端只认白名单里的 Origin，新域名一律被拒，表现为 fetch 失败。
  */
-function markCloudUnavailable() {
+function markCloudUnavailable(reason) {
   const opt = document.querySelector('#engine option[value="cloud"]');
   if (opt) {
     opt.disabled = true;
     opt.textContent = "云服务（暂不可用）";
+    if (reason) opt.title = reason;
   }
   if ($("engine").value === "cloud") $("engine").value = "own";
 }
@@ -298,6 +302,13 @@ async function refreshStats() {
   } catch (e) {
     // 统计失败不影响主流程，不弹错误
     console.warn("统计读取失败", e);
+
+    /* 但也不能当没发生：统计和云服务链路走同一个云端 endpoint、
+       同一套 Origin 白名单。统计拉不到，通常意味着云服务链路也用不了
+       （最常见的原因就是换了域名、没加白名单）。
+       这里顺手把云服务选项标灰，比让用户点了「云服务」再撞一堵墙好。
+       代价是临时网络抖动会误判一次——刷新页面就恢复了。 */
+    markCloudUnavailable("当前域名不在云端白名单里，或云端暂时不可达");
   }
 }
 

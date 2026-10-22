@@ -373,6 +373,38 @@ python share.py --tunnel
 
 **Render 后面取真实 IP 的细节**：Render 是反向代理，`request.client.host` 拿到的是内网地址。`client_ip()` 会自动识别"来源是内网 → 说明有反代"，然后**从 X-Forwarded-For 右边往左找第一个公网地址**。之所以不是直接取最后一段：Render 会把代理自己的内网地址追加在末尾，直接取最后一段会让所有访客算成同一个 IP，20 次/天的限额被几十个人瞬间分完。这条逻辑有 8 个单测覆盖（公网来源忽略 XFF、跳过尾部代理、多级代理、全内网兜底、伪造非 IP 串、`TRUST_PROXY` 强制）。
 
+### 四、绑自己的域名（Render + Cloudflare DNS）
+
+有域名的话就别用 `onrender.com` 那个地址了——简历上和名片上都不好看，而且免费实例换服务名就变。
+
+**1. Render 侧：加 Custom Domain**
+
+服务页 → Settings → Custom Domains → Add Custom Domain → 填子域名，比如 `ai.example.com`。
+Render 会返回一个 CNAME 目标值，通常是 `<服务名>.onrender.com`。
+
+**2. Cloudflare 侧：加 CNAME 记录**
+
+DNS → Records → Add record：
+
+| 字段 | 值 |
+|---|---|
+| Type | `CNAME` |
+| Name | `ai`（只填前缀，CF 会自动补全域名） |
+| Target | `<服务名>.onrender.com`（Render 给的那个） |
+| Proxy status | **DNS only（灰云）** ← 关键 |
+
+**3. 回 Render 点 Verify，等证书签发（几分钟）**
+
+**为什么必须灰云（DNS only）**
+
+Cloudflare 橙云会在 Render 前面再加一层代理，Render 签发 Let's Encrypt 证书时做的域名验证会被 CF 拦掉，结果是「域名能开但证书报错」或者干脆 522。要开橙云也不是不行，但得把 SSL/TLS 模式改成 Full (strict) 且 Render 侧证书已签好——多一层配置多一个坏点，对一个演示服务不划算。
+
+**绑完后会掉一条链路，这是预期内的**
+
+新域名等于新 Origin，云端白名单里没有它 → 「云服务」链路会被拒（`Failed to fetch`），顶部统计也读不到。主链路「我的 Key」完全正常。
+
+页面已经处理了这种情况：`refreshStats()` 一旦失败就把云服务选项标灰并挂上原因提示，不会让你点了才撞墙。要让云服务链路也恢复，去云服务后台把 `ai.example.com` 加进白名单即可。
+
 ### 公开之前先想一件事
 
 **别人用的是你的 API 额度。** 目前的口子是每 IP 每天 20 次 + 全站每天 300 次（`app.py` 顶部改）。按 `deepseek-v4.1-flash` 的价格，全站刷满一天也就是几毛钱，可接受；但如果你换成贵模型，先把 `MAX_CALLS_PER_DAY_GLOBAL` 调小再发链接。
