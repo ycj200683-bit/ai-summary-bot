@@ -102,6 +102,34 @@ class SummarizeOut(BaseModel):
     remaining: int = -1         # -1 = 未知（老客户端/未走限流）
 
 
+# ---- Agent 接口的请求/响应 ----
+class AgentIn(BaseModel):
+    query: str = Field(..., min_length=1, max_length=1000,
+                       description="给 Agent 的自然语言指令")
+    # 步数上限是 Agent 的生命线：没有它，模型可能在两个工具之间来回调到天荒地老，
+    # 一次请求烧掉几十次 API 调用。默认 6 步，上限 10 步。
+    max_steps: int = Field(6, ge=1, le=10, description="最大执行步数，1~10")
+
+
+class AgentStep(BaseModel):
+    step: int
+    tool: str
+    args: dict
+    ok: bool
+    elapsed_ms: int | None = None
+    error: str | None = None
+
+
+class AgentOut(BaseModel):
+    answer: str
+    trace: list[AgentStep]
+    steps: int
+    elapsed_ms: int
+    model: str
+    remaining: int = -1
+    hit_max_steps: bool = False
+
+
 # ============================================================
 # 3) 内部小工具
 # ============================================================
@@ -355,6 +383,23 @@ def read_index() -> str:
     return _index_cache["body"]
 
 
+# 多页面的通用缓存：{文件名: {"mtime", "body"}}
+# 复用同一套"按 mtime 失效"的思路，避免为每个页面各写一份缓存逻辑。
+_page_cache: dict[str, dict] = {}
+
+
+def read_page(filename: str) -> str:
+    """读 web/ 下的任意页面，文件没变就用缓存。"""
+    path = os.path.join(WEB_DIR, filename)
+    mtime = os.path.getmtime(path)
+    cached = _page_cache.get(filename)
+    if cached is None or cached["mtime"] != mtime:
+        with open(path, "r", encoding="utf-8") as f:
+            cached = {"mtime": mtime, "body": f.read()}
+        _page_cache[filename] = cached
+    return cached["body"]
+
+
 @app.post("/api/quota/take")
 def quota_take(request: Request) -> dict:
     """
@@ -367,6 +412,73 @@ def quota_take(request: Request) -> dict:
     """
     remaining = check_quota(client_ip(request))
     return {"ok": True, "remaining": remaining, "limit": MAX_CALLS_PER_DAY}
+
+
+@app.post("/api/agent", response_model=AgentOut)
+def agent_run(payload: AgentIn, request: Request) -> AgentOut:
+    """
+    Agent 接口：给一句自然语言指令，模型自己决定调哪些工具、调几次。
+
+    ★ 和 /api/summarize 的本质区别：
+      摘要是"一次输入 → 一次输出"，路径固定；
+      Agent 是"输入 → 模型决定 → 工具执行 → 再决定 …… → 输出"，路径不固定。
+      所以返回里除了 answer，还必须带 trace —— 否则用户看到结果也不知道它干了什么。
+
+    ★ 为什么先扣额度再执行：
+      一次 Agent 请求内部可能触发 2-6 次模型调用 + 若干次工具执行，
+      成本远高于单次摘要。按"1 次请求 = 1 次额度"计，是刻意让额度口径简单可预期；
+      真正上线时更合理的做法是按 token 或按步数计费，这里先用次数。
+    """
+    query = payload.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="指令不能是空白")
+
+    remaining = check_quota(client_ip(request))
+
+    # 延迟导入：agent.py 依赖 main.py，放在函数里导入可以保证
+    # "agent 模块出问题时，/api/summarize 等既有接口照常可用"——
+    # 一个功能挂掉不该拖垮整个服务。
+    from agent import _CURRENT_CLIENT, ToolCallingClient, run_agent
+
+    client = get_client()
+    # summarize_text 工具需要 client，运行前绑定
+    _CURRENT_CLIENT["client"] = client
+    runner = ToolCallingClient(client.config, timeout=120)
+
+    try:
+        result = run_agent(query, runner, max_steps=payload.max_steps)
+    except RetryableError as e:
+        raise HTTPException(status_code=502, detail=f"上游模型服务不稳定，请稍后再试：{e}")
+    except FatalError as e:
+        raise HTTPException(status_code=502, detail=f"模型调用失败：{e}")
+
+    return AgentOut(
+        answer=result["answer"].strip(),
+        trace=[AgentStep(**s) for s in result["trace"]],
+        steps=result["steps"],
+        elapsed_ms=result["elapsed_ms"],
+        model=_model_name,
+        remaining=remaining,
+        hit_max_steps=bool(result.get("hit_max_steps")),
+    )
+
+
+@app.get("/agent", response_class=HTMLResponse)
+def agent_page():
+    """
+    Agent 演练场页面。
+
+    ★ 为什么不直接改首页：首页 721 行，承载着摘要主流程、云服务 SDK、
+      流式渲染和历史统计。为了加一个功能去改它，风险远大于收益。
+      新开一个页面 = 零风险试错，跑顺了再考虑合并。
+    """
+    try:
+        return read_page("agent.html")
+    except FileNotFoundError:
+        return HTMLResponse(
+            "<h1>web/agent.html 找不到</h1><p>页面文件没有跟着部署包一起上传。</p>",
+            status_code=500,
+        )
 
 
 @app.get("/", response_class=HTMLResponse)
