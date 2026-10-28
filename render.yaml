@@ -41,3 +41,10 @@ services:
       # 若渲染报"版本不存在"，去 https://render.com/docs/python-version 换成列出的可用版本
       - key: PYTHON_VERSION
         value: "3.13.4"
+
+      # ★ 知识库必须指到可写目录：Render 上代码目录是只读的，
+      #   默认的 data/kb.sqlite3 会在入库时报 "unable to open database file"。
+      #   代价是 /tmp 是临时的——重新部署会清空知识库，需要持久化得挂磁盘
+      #   （免费档不支持），或者改成启动时从对象存储拉一次。
+      - key: KB_DIR
+        value: /tmp/kbdata

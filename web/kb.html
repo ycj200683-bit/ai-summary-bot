@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>知识库检索</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Microsoft YaHei", sans-serif;
+    background: #f6f7f9; color: #1a1a1a; line-height: 1.6;
+    min-height: 100vh; padding: 28px 16px 56px;
+  }
+  .wrap { max-width: 820px; margin: 0 auto; }
+
+  header {
+    margin-bottom: 18px; display: flex; align-items: flex-start;
+    justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+  h1 { font-size: 25px; font-weight: 700; letter-spacing: -0.3px; }
+  h1 span { color: #4f46e5; }
+  .sub { color: #6b7280; font-size: 14px; margin-top: 5px; }
+  .nav-links { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+  .nav-links a {
+    padding: 7px 13px; font-size: 13px; font-weight: 600;
+    color: #4f46e5; background: #fff; border: 1px solid #c7d2fe;
+    border-radius: 999px; text-decoration: none; white-space: nowrap;
+    transition: background .15s, border-color .15s;
+  }
+  .nav-links a:hover { background: #eef2ff; border-color: #a5b4fc; }
+
+  .card {
+    background: #fff; border: 1px solid #e5e7eb; border-radius: 14px;
+    padding: 20px; box-shadow: 0 1px 2px rgba(0,0,0,.04); margin-bottom: 16px;
+  }
+  .card h2 { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+  .card .hint { font-size: 13px; color: #9ca3af; margin-bottom: 14px; }
+
+  input[type="text"], textarea {
+    width: 100%; padding: 11px 13px; font-size: 14px; font-family: inherit;
+    line-height: 1.7; color: #111827; border: 1px solid #d1d5db;
+    border-radius: 10px; outline: none; transition: border-color .15s;
+  }
+  input[type="text"]:focus, textarea:focus {
+    border-color: #4f46e5; box-shadow: 0 0 0 3px rgba(79,70,229,.1);
+  }
+  textarea { min-height: 120px; resize: vertical; margin-top: 10px; }
+  .row { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+  .count { font-size: 13px; color: #9ca3af; font-variant-numeric: tabular-nums; }
+  .count.over { color: #dc2626; font-weight: 600; }
+
+  button {
+    font-family: inherit; cursor: pointer; border-radius: 9px;
+    transition: background .15s, transform .05s;
+  }
+  button.primary {
+    margin-left: auto; padding: 10px 22px; font-size: 15px; font-weight: 600;
+    color: #fff; background: #4f46e5; border: none;
+  }
+  button.primary:hover:not(:disabled) { background: #4338ca; }
+  button.primary:active:not(:disabled) { transform: translateY(1px); }
+  button.primary:disabled { background: #a5b4fc; cursor: not-allowed; }
+  button.ghost {
+    padding: 6px 12px; font-size: 13px; font-weight: 600;
+    color: #6b7280; background: #fff; border: 1px solid #e5e7eb;
+  }
+  button.ghost:hover { background: #f9fafb; color: #374151; }
+  button.danger { color: #b91c1c; border-color: #fecaca; }
+  button.danger:hover { background: #fef2f2; color: #991b1b; }
+
+  .banner {
+    display: none; margin-bottom: 14px; padding: 11px 14px; border-radius: 10px;
+    font-size: 14px; background: #fffbeb; border: 1px solid #fde68a; color: #92400e;
+  }
+  .banner.show { display: block; }
+  .banner.err { background: #fef2f2; border-color: #fecaca; color: #991b1b; }
+  .banner.ok { background: #f0fdf4; border-color: #bbf7d0; color: #166534; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid #f3f4f6; }
+  th { font-size: 12px; color: #9ca3af; font-weight: 600; }
+  td.num { font-variant-numeric: tabular-nums; color: #6b7280; }
+  .empty { font-size: 14px; color: #9ca3af; padding: 8px 0; }
+
+  .hit {
+    padding: 12px 0; border-bottom: 1px solid #f3f4f6;
+  }
+  .hit:last-child { border-bottom: none; }
+  .hit-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
+  .score {
+    font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 999px;
+    background: #eef2ff; color: #4338ca; font-variant-numeric: tabular-nums;
+  }
+  .score.high { background: #dcfce7; color: #15803d; }
+  .score.low { background: #f3f4f6; color: #6b7280; }
+  .src { font-size: 12px; color: #9ca3af; }
+  .hit-text { font-size: 14px; color: #374151; white-space: pre-wrap; word-break: break-word; }
+  .chip {
+    padding: 5px 11px; font-size: 13px; color: #4b5563;
+    background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 999px;
+  }
+  .chip:hover { background: #f3f4f6; border-color: #d1d5db; }
+  footer { margin-top: 20px; font-size: 13px; color: #9ca3af; text-align: center; }
+  footer a { color: #6b7280; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="banner" id="banner"></div>
+
+  <header>
+    <div>
+      <h1>知识<span>库</span></h1>
+      <p class="sub">贴文档进来 → 切片向量化 → 按语义检索。检索结果会作为工具提供给 Agent。</p>
+    </div>
+    <div class="nav-links">
+      <a href="/" title="回到摘要首页">← 摘要</a>
+      <a href="/agent" title="让模型自己决定调哪个工具">Agent 模式 →</a>
+    </div>
+  </header>
+
+  <!-- ============ 1) 上传 ============ -->
+  <div class="card">
+    <h2>上传文档</h2>
+    <p class="hint">纯文本即可（.txt / .md / 复制粘贴）。单篇上限 20000 字，内容相同的文档不会重复入库。</p>
+    <input type="text" id="doc-name" placeholder="文档名，例如：项目README.md（检索结果里会显示这个来源）" aria-label="文档名">
+    <textarea id="doc-text" placeholder="把文档正文粘在这里……" aria-label="文档正文"></textarea>
+    <div class="row">
+      <span class="count" id="doc-count">0 / 20000</span>
+      <button class="ghost" id="btn-clear" type="button">清空</button>
+      <button class="primary" id="btn-upload" type="button">入库</button>
+    </div>
+  </div>
+
+  <!-- ============ 2) 文档列表 ============ -->
+  <div class="card">
+    <h2>已入库文档</h2>
+    <p class="hint" id="docs-hint">加载中……</p>
+    <div id="docs-box"></div>
+  </div>
+
+  <!-- ============ 3) 检索 ============ -->
+  <div class="card">
+    <h2>检索测试</h2>
+    <p class="hint">这一步只走向量检索、不经过模型。答得不好时先看这里的前几名分数，能分清是检索没找到还是模型没用对。</p>
+    <input type="text" id="q" placeholder="输入一个问题或关键词，例如：限流是怎么做的" aria-label="检索问题">
+    <div class="row">
+      <button class="chip" type="button" data-q="限流和配额是怎么实现的">限流怎么做</button>
+      <button class="chip" type="button" data-q="Agent 是怎么防死循环的">Agent 防死循环</button>
+      <button class="chip" type="button" data-q="部署上线到哪个平台">部署到哪</button>
+      <select id="topk" aria-label="返回几条" style="padding:8px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;font-family:inherit;color:#374151;background:#fff;margin-left:auto">
+        <option value="3">3 条</option>
+        <option value="4" selected>4 条</option>
+        <option value="6">6 条</option>
+        <option value="10">10 条</option>
+      </select>
+      <button class="primary" id="btn-search" type="button" style="margin-left:0">检索</button>
+    </div>
+    <div id="hits-box" style="margin-top:14px"></div>
+  </div>
+
+  <footer>
+    向量 1024 维（text-embedding-v3）· 余弦相似度 · 存 sqlite · 入库时已做 L2 归一化，检索只算点积<br>
+    想看模型带着这份知识库回答问题？去 <a href="/agent">Agent 模式</a> 问「资料里怎么说」类问题
+  </footer>
+</div>
+
+<script>
+/* ============================================================
+ * 全局约定：
+ *   1) 所有从服务端拿到的文本一律用 textContent 写进 DOM，不用 innerHTML ——
+ *      文档正文是用户输入，拼 HTML 就是 XSS 直通车。
+ *   2) 额度不足（429）单独提示，别和"服务出错"混在一起，否则用户不知道该干嘛。
+ * ============================================================ */
+(function () {
+  var banner = document.getElementById('banner');
+  var docName = document.getElementById('doc-name');
+  var docText = document.getElementById('doc-text');
+  var docCount = document.getElementById('doc-count');
+  var btnUpload = document.getElementById('btn-upload');
+  var btnClear = document.getElementById('btn-clear');
+  var btnSearch = document.getElementById('btn-search');
+  var qInput = document.getElementById('q');
+  var topk = document.getElementById('topk');
+  var docsBox = document.getElementById('docs-box');
+  var docsHint = document.getElementById('docs-hint');
+  var hitsBox = document.getElementById('hits-box');
+
+  var MAX_CHARS = 20000;
+
+  function say(msg, kind) {
+    banner.textContent = msg;
+    banner.className = 'banner show' + (kind ? ' ' + kind : '');
+    if (kind === 'ok') {
+      setTimeout(function () { banner.className = 'banner'; }, 4000);
+    }
+  }
+
+  function clearBanner() { banner.className = 'banner'; }
+
+  /* 统一的请求封装：把 HTTP 状态码翻译成用户能看懂的话。
+     重点是把 429（额度用完）、409（维度不一致）、502（上游挂了）分开。 */
+  function postJSON(url, body) {
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (data) {
+        if (resp.ok) return data;
+        if (resp.status === 429) throw new Error(data.detail || '今天的额度用完了，明天再来');
+        if (resp.status === 409) throw new Error(data.detail || '向量维度不一致，需要先清空重建知识库');
+        if (resp.status === 502) throw new Error(data.detail || '模型服务不稳定，稍后再试');
+        throw new Error(data.detail || ('请求失败（HTTP ' + resp.status + '）'));
+      });
+    });
+  }
+
+  /* ---------- 字数计数 ---------- */
+  function refreshCount() {
+    var n = docText.value.length;
+    docCount.textContent = n + ' / ' + MAX_CHARS;
+    docCount.className = 'count' + (n > MAX_CHARS ? ' over' : '');
+    btnUpload.disabled = n > MAX_CHARS;
+  }
+  docText.addEventListener('input', refreshCount);
+  refreshCount();
+
+  /* ---------- 上传 ---------- */
+  btnClear.addEventListener('click', function () {
+    docText.value = '';
+    refreshCount();
+    clearBanner();
+  });
+
+  btnUpload.addEventListener('click', function () {
+    var name = docName.value.trim();
+    var text = docText.value;
+    if (!name) { say('给文档起个名字，检索结果要靠它标来源'); docName.focus(); return; }
+    if (!text.trim()) { say('正文是空的'); docText.focus(); return; }
+
+    btnUpload.disabled = true;
+    btnUpload.textContent = '向量化中…';
+    clearBanner();
+
+    postJSON('/api/kb/upload', { name: name, text: text }).then(function (data) {
+      if (data.skipped) {
+        say('内容相同的文档已经在库里（doc_id=' + data.id + '，' + data.n_chunks + ' 块），没有重复消耗额度', 'ok');
+      } else {
+        say('已入库：' + data.n_chunks + ' 块，剩余额度 ' + data.remaining + ' 次', 'ok');
+        docText.value = '';
+        refreshCount();
+      }
+      return loadDocs();
+    }).catch(function (err) {
+      say(err.message, 'err');
+    }).finally(function () {
+      btnUpload.disabled = false;
+      btnUpload.textContent = '入库';
+    });
+  });
+
+  /* ---------- 文档列表 ---------- */
+  function loadDocs() {
+    return fetch('/api/kb/docs').then(function (r) { return r.json(); }).then(function (data) {
+      var docs = data.docs || [];
+      docsHint.textContent = docs.length
+        ? '共 ' + docs.length + ' 篇，合计 ' + docs.reduce(function (s, d) { return s + d.n_chunks; }, 0) + ' 块'
+        : '还是空的，先把上面的文档传进来';
+
+      docsBox.textContent = '';
+      if (!docs.length) {
+        var p = document.createElement('p');
+        p.className = 'empty';
+        p.textContent = '（空）';
+        docsBox.appendChild(p);
+        return;
+      }
+
+      var table = document.createElement('table');
+      var thead = document.createElement('thead');
+      var hr = document.createElement('tr');
+      ['#', '文档名', '块数', '入库时间', ''].forEach(function (label) {
+        var th = document.createElement('th');
+        th.textContent = label;
+        hr.appendChild(th);
+      });
+      thead.appendChild(hr);
+      table.appendChild(thead);
+
+      var tbody = document.createElement('tbody');
+      docs.forEach(function (d) {
+        var tr = document.createElement('tr');
+
+        var tdId = document.createElement('td');
+        tdId.className = 'num';
+        tdId.textContent = d.id;
+
+        var tdName = document.createElement('td');
+        tdName.textContent = d.name;          // 用户输入 → 必须 textContent
+
+        var tdChunks = document.createElement('td');
+        tdChunks.className = 'num';
+        tdChunks.textContent = d.n_chunks;
+
+        var tdTime = document.createElement('td');
+        tdTime.className = 'num';
+        tdTime.textContent = d.created_at;
+
+        var tdOp = document.createElement('td');
+        var btn = document.createElement('button');
+        btn.className = 'ghost danger';
+        btn.type = 'button';
+        btn.textContent = '删除';
+        btn.addEventListener('click', function () { removeDoc(d.id, d.name); });
+        tdOp.appendChild(btn);
+
+        [tdId, tdName, tdChunks, tdTime, tdOp].forEach(function (td) { tr.appendChild(td); });
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      docsBox.appendChild(table);
+    }).catch(function (err) {
+      docsHint.textContent = '列表加载失败：' + err.message;
+    });
+  }
+
+  function removeDoc(id, name) {
+    if (!confirm('删除「' + name + '」以及它的所有块？')) return;
+    fetch('/api/kb/docs/' + id, { method: 'DELETE' }).then(function (r) {
+      if (!r.ok) throw new Error('删除失败（HTTP ' + r.status + '）');
+      say('已删除「' + name + '」', 'ok');
+      return loadDocs();
+    }).catch(function (err) { say(err.message, 'err'); });
+  }
+
+  /* ---------- 检索 ---------- */
+  function renderHits(hits) {
+    hitsBox.textContent = '';
+    if (!hits.length) {
+      var p = document.createElement('p');
+      p.className = 'empty';
+      p.textContent = '没命中。要么知识库是空的，要么这个问题和已入库内容确实不相关。';
+      hitsBox.appendChild(p);
+      return;
+    }
+
+    hits.forEach(function (h, i) {
+      var box = document.createElement('div');
+      box.className = 'hit';
+
+      var head = document.createElement('div');
+      head.className = 'hit-head';
+
+      var score = document.createElement('span');
+      // 分数分档：>0.55 基本确定相关；0.4~0.55 可能相关；更低就是弱匹配了
+      score.className = 'score' + (h.score >= 0.55 ? ' high' : (h.score < 0.4 ? ' low' : ''));
+      score.textContent = h.score.toFixed(3);
+
+      var rank = document.createElement('span');
+      rank.className = 'src';
+      rank.textContent = '#' + (i + 1);
+
+      var src = document.createElement('span');
+      src.className = 'src';
+      src.textContent = h.doc + ' · 第 ' + h.chunk + ' 块';
+
+      head.appendChild(score);
+      head.appendChild(rank);
+      head.appendChild(src);
+
+      var text = document.createElement('div');
+      text.className = 'hit-text';
+      text.textContent = h.text;
+
+      box.appendChild(head);
+      box.appendChild(text);
+      hitsBox.appendChild(box);
+    });
+  }
+
+  function doSearch() {
+    var query = qInput.value.trim();
+    if (!query) { say('先输入要检索的问题'); qInput.focus(); return; }
+
+    btnSearch.disabled = true;
+    btnSearch.textContent = '检索中…';
+    clearBanner();
+
+    postJSON('/api/kb/search', { query: query, top_k: parseInt(topk.value, 10) })
+      .then(renderHits)
+      .catch(function (err) { say(err.message, 'err'); })
+      .finally(function () {
+        btnSearch.disabled = false;
+        btnSearch.textContent = '检索';
+      });
+  }
+
+  btnSearch.addEventListener('click', doSearch);
+  qInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') doSearch();
+  });
+
+  Array.prototype.forEach.call(document.querySelectorAll('.chip[data-q]'), function (chip) {
+    chip.addEventListener('click', function () {
+      qInput.value = chip.getAttribute('data-q');
+      doSearch();
+    });
+  });
+
+  /* ---------- 首屏 ---------- */
+  loadDocs();
+})();
+</script>
+</body>
+</html>

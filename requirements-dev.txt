@@ -1,2 +1,7 @@
 requests
 pytest
+
+# TestClient 的运行依赖。starlette 1.x 起把它拆成独立包（httpx2），
+# 不装的话 tests/test_app.py 在收集阶段就报 RuntimeError，
+# 表现为"一个用例都没跑就 Interrupted"，容易误以为是代码坏了。
+httpx2

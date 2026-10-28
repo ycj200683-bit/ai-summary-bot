@@ -161,9 +161,22 @@ def get_client() -> LLMClient:
     return _client
 
 
+def connect_kb():
+    """
+    打开知识库的 sqlite 连接。
+
+    ★ 为什么再包一层而不是直接 from kb import connect：
+      知识库依赖 sqlite 文件可写、embedding 接口可用。把它放在函数内导入，
+      意味着"即使 kb.py 整个坏掉，摘要和 Agent 接口照样能用"——
+      单元测试里可以用 monkeypatch 换掉它，不用起真实数据库。
+    """
+    from kb import connect
+
+    return connect()
+
+
 # 强制信任 X-Forwarded-For（代理在另一台机器上、直连来源是公网 IP 时才需要）
 TRUST_PROXY = (os.getenv("TRUST_PROXY") or "").strip().lower() in ("1", "true", "yes", "on")
-
 
 # 视为"前面有反代"的来源地址段。
 # ★ 为什么不用 ipaddress 自带的 is_private：
@@ -464,6 +477,162 @@ def agent_run(payload: AgentIn, request: Request) -> AgentOut:
         remaining=remaining,
         hit_max_steps=bool(result.get("hit_max_steps")),
     )
+
+
+# ============================================================
+# 3.6) 知识库：入库 / 列表 / 检索
+# ============================================================
+# ★ 为什么这几个接口都不走 Agent：
+#   入库和检索是"确定性操作"，返回什么完全由输入决定，中间没有"模型决定做什么"。
+#   包成 Agent 只会多花一次模型调用、多几十秒延迟，还引入不确定性。
+#   Agent 是给"不知道该用什么工具"的场景用的（/api/agent），不是给固定流程用的。
+
+class KbUploadIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120, description="文档名，用于检索结果里标来源")
+    # 20000 字约等于 50 块、5 批 embedding 请求，成本和时间都可控。
+    # 不设上限的话，贴一本小说进来会跑几百批请求，前端早超时了。
+    text: str = Field(..., min_length=1, max_length=20000)
+
+
+class KbDocOut(BaseModel):
+    id: int
+    name: str
+    n_chunks: int
+    created_at: str
+
+
+class KbSearchIn(BaseModel):
+    query: str = Field(..., min_length=1, max_length=500)
+    top_k: int = Field(4, ge=1, le=10)
+
+
+class KbHit(BaseModel):
+    score: float
+    doc: str
+    doc_id: int
+    chunk: int
+    text: str
+
+
+@app.post("/api/kb/upload")
+def kb_upload(payload: KbUploadIn, request: Request) -> dict:
+    """
+    文档入库：切片 → 向量化 → 存 sqlite。
+
+    ★ 扣额度：这一步会真金白银调 embedding 接口，所以和摘要一样算一次额度。
+      检索本身也要调一次 embedding（问题向量化），但量太小，不单独扣。
+    ★ 幂等：同样的内容重复上传直接返回旧的 doc_id。判断依据是
+      内容 sha256，不是文件名——改个名传同一篇不会存两份。
+    ★ 顺序很关键：先查重、再扣额度。反过来的话重复上传会白吃一次额度，
+      而前端还在显示"没有重复消耗额度"，等于对用户说假话。
+    """
+    from kb import add_document, find_existing   # 延迟导入：知识库坏了不该拖垮摘要主流程
+
+    conn = connect_kb()
+    try:
+        existing = find_existing(conn, payload.text)
+        if existing is not None:
+            # 没花 embedding 请求，就不扣额度；remaining 返回 -1 表示"本次未扣"
+            return {
+                "ok": True,
+                "id": existing["id"],
+                "name": existing["name"],
+                "n_chunks": existing["n_chunks"],
+                "skipped": True,
+                "remaining": -1,
+            }
+
+        remaining = check_quota(client_ip(request))
+
+        try:
+            info = add_document(conn, payload.name.strip(), payload.text)
+        except (FatalError, RetryableError) as e:
+            raise HTTPException(status_code=502, detail=f"向量化失败：{e}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except RuntimeError as e:
+            # 典型是换了 embedding 模型导致维度不一致，属于冲突而不是入参错误
+            raise HTTPException(status_code=409, detail=str(e))
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "id": info["id"],
+        "name": info["name"],
+        "n_chunks": info["n_chunks"],
+        "skipped": info["skipped"],
+        "remaining": remaining,
+    }
+
+
+@app.get("/api/kb/docs")
+def kb_docs() -> dict:
+    """列出知识库里的文档。前端每次入库/删除后都会重新拉一次。"""
+    from kb import list_documents
+
+    conn = connect_kb()
+    try:
+        docs = list_documents(conn)
+    finally:
+        conn.close()
+    return {"ok": True, "docs": docs, "count": len(docs)}
+
+
+@app.delete("/api/kb/docs/{doc_id}")
+def kb_delete(doc_id: int) -> dict:
+    """删文档，chunks 靠外键级联一起清掉。"""
+    from kb import delete_document
+
+    conn = connect_kb()
+    try:
+        ok = delete_document(conn, doc_id)
+    finally:
+        conn.close()
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"文档 {doc_id} 不存在")
+    return {"ok": True, "deleted": doc_id}
+
+
+@app.post("/api/kb/search", response_model=list[KbHit])
+def kb_search(payload: KbSearchIn) -> list[KbHit]:
+    """
+    纯检索接口（不经过模型生成回答），用来单独验证检索效果。
+
+    ★ 为什么要有这个接口：Agent 的回答是"检索 + 生成"混合的结果，
+      答得不好时分不清是检索没找到还是模型没用好。先看这里的前几名分数，
+      就能把问题定位到检索层。
+    """
+    from kb import search
+
+    try:
+        conn = connect_kb()
+        try:
+            hits = search(conn, payload.query, top_k=payload.top_k)
+        finally:
+            conn.close()
+    except (FatalError, RetryableError) as e:
+        raise HTTPException(status_code=502, detail=f"向量化失败：{e}")
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    return [
+        KbHit(score=h["score"], doc=h["doc"], doc_id=h["doc_id"],
+              chunk=h["ord"], text=h["text"])
+        for h in hits
+    ]
+
+
+@app.get("/kb", response_class=HTMLResponse)
+def kb_page():
+    """知识库页面：上传文档、看列表、试检索。"""
+    try:
+        return read_page("kb.html")
+    except FileNotFoundError:
+        return HTMLResponse(
+            "<h1>web/kb.html 找不到</h1><p>页面文件没有跟着部署包一起上传。</p>",
+            status_code=500,
+        )
 
 
 @app.get("/agent", response_class=HTMLResponse)

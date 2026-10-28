@@ -131,7 +131,22 @@ def read_file(path: str) -> str:
         raise ValueError(f"拒绝访问项目目录之外的路径：{path}")
     if not target.exists():
         raise FileNotFoundError(f"文件不存在：{path}")
-    return target.read_text(encoding="utf-8")
+
+    text = target.read_text(encoding="utf-8")
+
+    # ★ 大小上限：工具返回值会原样进模型上下文，一个 200KB 的日志就能把请求撑爆
+    #   （上游直接报 too many tokens），而这个错误在 trace 里只表现为"工具调用失败"，
+    #   很难看出根因。与其让它失败得莫名其妙，不如截断并明确告诉模型"还有多少没读"。
+    #   实测到的问题：模型会为了省事用 read_file 把整份文档读进来，绕过检索——
+    #   小文件没问题，大文件就很危险，所以这道闸门必须有。
+    MAX_CHARS = 12000
+    if len(text) > MAX_CHARS:
+        hint = (
+            f"\n\n……（文件共 {len(text)} 字，已截断到前 {MAX_CHARS} 字；"
+            "要看后面的内容，请不要整份读，改用 search_kb 按问题检索）"
+        )
+        return text[:MAX_CHARS] + hint
+    return text
 
 
 # summarize_text 需要 LLMClient，所以用"延迟绑定"：运行时把 client 塞进上下文
@@ -155,6 +170,62 @@ def summarize_text(text: str, sentences: int = 3) -> str:
     if client is None:
         raise RuntimeError("summarize_text 需要先绑定 LLMClient")
     return Summarizer(client, max_sentences=sentences).summarize(text)
+
+
+@tool(
+    name="search_kb",
+    description=(
+        "在本地知识库里检索与问题最相关的段落，返回带来源和相似度分数的片段。"
+        "当用户问'资料/文档里怎么说''有没有提到过某某'这类需要查资料的问题时使用。"
+        "不要用它查实时信息（天气、股价、新闻），它只覆盖已入库的文档。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "检索用的关键词或完整问句，越具体越准"},
+            "top_k": {"type": "integer", "description": "返回几段，默认 4"},
+        },
+        "required": ["query"],
+    },
+)
+def search_kb(query: str, top_k: int = 4) -> list[dict]:
+    """
+    知识库检索工具。
+
+    ★ 为什么把 kb 的导入放在函数里：
+      知识库依赖 sqlite 文件、embedding 接口、向量维度校验，任何一环坏了
+      （比如换过 embedding 模型导致维度不一致），都不该让 count_words、
+      summarize_text 这些不相干的工具跟着不可用。
+
+    ★ 为什么返回前把每段截到 600 字（而不是全文）：
+      工具返回值会原样塞回模型上下文。4 段 × 400 字的完整块，加上原有消息，
+      很容易把上下文撑大、变慢变贵。600 字是实测调出来的：截到 300 字时
+      模型经常觉得"信息不够"，转而用 read_file 把整份文档读进来绕过检索；
+      放到 600 字之后基本一次就能答完。
+    """
+    from kb import connect, search          # 延迟导入，见上面注释
+
+    client = _CURRENT_CLIENT.get("client")
+    config = client.config if client is not None else None
+
+    conn = connect()
+    try:
+        hits = search(conn, query, top_k=top_k, config=config)
+    finally:
+        conn.close()                        # 一定要关，Windows 上不关会锁住库文件
+
+    if not hits:
+        return [{"info": "知识库为空或没有匹配内容，请先入库文档"}]
+
+    return [
+        {
+            "score": h["score"],
+            "doc": h["doc"],
+            "chunk": h["ord"],
+            "text": h["text"][:600],
+        }
+        for h in hits
+    ]
 
 
 def execute_tool(name: str, args: dict) -> dict:

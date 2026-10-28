@@ -15,6 +15,7 @@ tests/test_app.py —— Web 层（app.py）的测试：限流、IP 解析、请
 """
 
 import os
+from array import array
 
 import pytest
 from fastapi.testclient import TestClient
@@ -241,3 +242,82 @@ def test_remaining_counts_down(client):
     first = client.post("/api/summarize", json=payload).json()["remaining"]
     second = client.post("/api/summarize", json=payload).json()["remaining"]
     assert first - second == 1
+
+
+# ============================================================
+# 6) 知识库：扣费时机与入参
+# ============================================================
+@pytest.fixture
+def kb_env(tmp_path, monkeypatch):
+    """
+    把知识库接到临时文件上，并把 embedding 换成假的——不联网、不花钱、结果稳定。
+
+    ★ 为什么连 connect_kb 一起换：
+      真实 connect() 会写项目下的 data/kb.sqlite3，跑测试会污染开发数据，
+      也没法在 CI 里并行。
+    ★ 为什么返回的是一个"每次新建连接"的工厂，而不是复用同一个连接：
+      FastAPI 的同步端点跑在线程池里，sqlite 默认禁止跨线程使用同一个连接
+      （sqlite3.ProgrammingError）。生产代码本来就是"一个请求一个连接"，
+      测试也应该照着来，而不是给连接加 check_same_thread=False 把这个差异掩盖掉。
+    ★ 为什么不换 kb.search / add_document：那是本项目自己的逻辑，正是要测的部分；
+      只把"外部世界"（网络、文件位置）挡掉。
+    """
+    import kb
+
+    db_file = tmp_path / "kb_test.sqlite3"
+    kb.connect(db_file).close()                     # 先建表
+    monkeypatch.setattr(app_module, "connect_kb", lambda: kb.connect(db_file))
+
+    def fake_embed(texts, config=None, **kwargs):
+        # 固定的 4 维假向量：不联网，也不影响"有没有扣额度"这件事
+        return [array("f", [0.5, 0.5, 0.5, 0.5]) for _ in texts]
+
+    monkeypatch.setattr(kb, "embed_texts", fake_embed)
+    yield db_file
+
+
+def test_duplicate_upload_does_not_consume_quota(client, kb_env):
+    """
+    回归测试：内容相同的文档重复上传，不该扣额度。
+
+    ★ 为什么专门测这一条：
+      最初的实现是"先 check_quota、再查重"，于是重复上传照样扣一次额度，
+      而前端提示写的是"没有重复消耗额度"——功能和文案对不上，
+      对用户来说就是"说一套做一套"。这种 bug 不会报错，只会悄悄多扣钱，
+      只能靠测试盯住。
+    """
+    before = client.get("/api/health").json()["used_today_global"]
+
+    first = client.post("/api/kb/upload", json={"name": "青海湖.txt", "text": "青海湖是最大的内陆咸水湖。"})
+    assert first.status_code == 200
+    assert first.json()["skipped"] is False
+    mid = client.get("/api/health").json()["used_today_global"]
+    assert mid == before + 1, "首次上传应该扣一次额度"
+
+    # 换个文件名、内容一模一样：靠内容 sha256 判定，照样算重复
+    second = client.post("/api/kb/upload", json={"name": "换个名字.txt", "text": "青海湖是最大的内陆咸水湖。"})
+    assert second.status_code == 200
+    body = second.json()
+    assert body["skipped"] is True
+    assert body["id"] == first.json()["id"], "重复内容应该指回原来的 doc_id"
+    assert body["remaining"] == -1, "未扣额度时 remaining 要明确返回 -1"
+
+    after = client.get("/api/health").json()["used_today_global"]
+    assert after == mid, "重复上传又扣了一次额度"
+
+
+def test_kb_search_topk_is_validated(client, kb_env):
+    # top_k 上限 10，越界由 Pydantic 拦在业务代码之外
+    r = client.post("/api/kb/search", json={"query": "任意问题", "top_k": 99})
+    assert r.status_code == 422
+
+
+def test_kb_delete_missing_doc_returns_404(client, kb_env):
+    r = client.delete("/api/kb/docs/999999")
+    assert r.status_code == 404
+    assert "999999" in r.json()["detail"]
+
+
+def test_kb_upload_empty_text_is_rejected(client, kb_env):
+    r = client.post("/api/kb/upload", json={"name": "空文档.txt", "text": ""})
+    assert r.status_code == 422

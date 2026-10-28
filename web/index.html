@@ -13,7 +13,7 @@
     min-height: 100vh; padding: 28px 16px 56px;
   }
   .wrap { max-width: 760px; margin: 0 auto; }
-  /* 标题在左、Agent 入口在右。用 flex 而不是绝对定位，
+  /* 标题在左、导航在右。用 flex 而不是绝对定位，
      并允许换行：极窄屏时胶囊会落到第二行，靠 margin-left:auto 保持右对齐，
      不会把标题挤成一条竖线。 */
   header {
@@ -23,13 +23,14 @@
   h1 { font-size: 25px; font-weight: 700; letter-spacing: -0.3px; }
   h1 span { color: #4f46e5; }
   .sub { color: #6b7280; font-size: 14px; margin-top: 5px; }
-  a.agent-entry {
-    flex: 0 0 auto; margin-left: auto; padding: 7px 13px; font-size: 13px; font-weight: 600;
+  .nav-links { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+  .nav-links a {
+    flex: 0 0 auto; padding: 7px 13px; font-size: 13px; font-weight: 600;
     color: #4f46e5; background: #fff; border: 1px solid #c7d2fe;
     border-radius: 999px; text-decoration: none; white-space: nowrap;
     transition: background .15s, border-color .15s;
   }
-  a.agent-entry:hover { background: #eef2ff; border-color: #a5b4fc; }
+  .nav-links a:hover { background: #eef2ff; border-color: #a5b4fc; }
 
   .stats {
     display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap;
@@ -128,9 +129,12 @@
       <h1>AI <span>摘要</span>服务</h1>
       <p class="sub">贴一段中文，返回几句话的要点。单次上限 5000 字。</p>
     </div>
-    <!-- Agent 入口：这个页面是"固定流程"，/agent 是"模型自己决定调什么工具"，
-         两者是同一套后端的两种用法，放在页头让人一眼能看见。 -->
-    <a class="agent-entry" href="/agent" title="换成 Agent 模式：由模型自己决定查字数、提关键词、读文件还是调摘要，完整调用过程可见">试试 Agent 模式 →</a>
+    <!-- 两个入口：这个页面是"固定流程"摘要；/agent 是"模型自己决定调什么工具"；
+         /kb 是"先入库再检索"。同一套后端的三种用法，放在页头一眼能看见。 -->
+    <div class="nav-links">
+      <a href="/kb" title="上传文档进知识库，按语义检索（向量检索，不是关键词匹配）">知识库</a>
+      <a href="/agent" title="换成 Agent 模式：由模型自己决定查字数、提关键词、读文件、查知识库还是调摘要，完整调用过程可见">试试 Agent 模式 →</a>
+    </div>
   </header>
 
   <div class="stats">

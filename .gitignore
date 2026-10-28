@@ -23,5 +23,9 @@ _page.png
 page.html
 _e2e.mjs
 
+# 知识库数据：sqlite 库 + 入库的原文，属于运行时数据，不入库
+data/
+kb.sqlite3
+
 # 本地项目数据（记忆、任务状态），不入库
 .workbuddy/
