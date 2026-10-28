@@ -325,6 +325,7 @@ curl -X POST http://127.0.0.1:8000/api/summarize \
 Agent 是**不固定路径**：输入 → 模型决定调哪个工具 → 执行 → 把结果喂回去 → 再决定 …… → 直到它不再要工具。
 
 页面：`http://127.0.0.1:8000/agent`　接口：`POST /api/agent`
+（首页页头右上角有「试试 Agent 模式」的入口，不用手敲地址）
 
 ![Agent 执行轨迹：读文件 → 统计字数 → 摘要，三步由模型自己串起来](docs/screenshots/agent-trace.png)
 
@@ -730,7 +731,7 @@ return cls(api_key=key, api_url=normalize_api_url(base_url), model=model)
 - [ ] Agent 的额度口径粗糙：一次请求内部可能 2-6 次模型调用，但只扣 1 次额度 → 按 token 或步数计费
 - [ ] Agent 的 trace 只返回给前端、不落库，刷新即丢 → 存 `steps` 表 + 历史查询接口
 - [ ] Agent 无工具结果缓存，同样的参数可能被重复调用 → 加一次会话内的结果缓存
-- [ ] `/agent` 页面还没有从首页入口链过去（临时直接用 `/agent` 访问）
+- [x] ~~`/agent` 没有首页入口，只能手敲地址~~ → 首页页头右上角已加「试试 Agent 模式」入口（360px 窄屏实测仍在一行内，不溢出）
 
 ---
 
