@@ -1,0 +1,44 @@
+# 打进镜像的东西越少越好。这不只是体积问题——
+# .env 被拷进镜像就等于把密钥固化在镜像层里，一旦 push 到任何镜像仓库就是泄露。
+.env
+.env.*
+
+# 依赖与缓存
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 版本库与编辑器
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# 运行时产物：日志和知识库都不该进镜像
+logs/
+data/
+*.log
+kb.sqlite3
+
+# 语料有版权，不进镜像
+corpus/
+
+# 测试与文档不进生产镜像
+tests/
+docs/
+conftest.py
+pytest.ini
+pyrightconfig.json
+
+# 本地脚本与截图
+learn_oop.py
+learn_decorator.py
+build_corpus.py
+fetch_corpus.py
+share.py
+batch.py
+requirements-dev.txt
+requirements.txt
+*.png

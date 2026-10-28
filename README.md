@@ -746,6 +746,33 @@ Cloudflare 橙云会在 Render 前面再加一层代理，Render 签发 Let's En
 
 页面已经处理了这种情况：`refreshStats()` 一旦失败就把云服务选项标灰并挂上原因提示，不会让你点了才撞墙。要让云服务链路也恢复，去云服务后台把 `ai.example.com` 加进白名单即可。
 
+### 六、Docker（自托管 / 任意云主机）
+
+```bash
+docker compose up -d --build      # 起服务
+docker compose logs -f            # 看日志
+docker compose down               # 停（数据留在卷里，不会丢）
+```
+
+访问 `http://127.0.0.1:8000`。密钥从 `.env` 读（`env_file`），不写进 compose。
+
+> ⚠️ **验证状态要说清楚**：这个镜像**还没在本机 build 过**——开发机上没装 Docker（`docker` 命令不存在），所以 `docker build` 这一步没有实跑。
+> 已经在等价环境验证过的是**应用层行为**：`PORT` 从外部注入、`KB_DIR` 指向独立目录、杀掉进程重启后知识库仍在（doc_id 与向量都在，检索分数 0.6154），以及导入 `app` 时不会加载 pandas/batch。
+> 也就是说：**能验证的是"这个容器该怎么跑才对"，没验证的是"build 那一步能不能过"**。首次在有 Docker 的机器上务必先跑一遍再写进任何材料。
+
+**三个必须这么写的理由**
+
+| 决定 | 原因 |
+|---|---|
+| **命名卷 `kb-data:/data`，不用 bind mount** | 知识库是 sqlite 文件，容器一删就没了。命名卷由 docker 管理，Windows/macOS 上不用操心路径与属主；bind mount 到宿主机目录会把镜像里设好的 `appuser` 权限覆盖掉，经常一挂载就 `Permission denied` |
+| **非 root 运行，且先 `mkdir /app/logs /data` 再 chown** | `main.py:84` 是 `os.makedirs("logs")` + `FileHandler("logs/app.log")`，路径**相对 CWD**。以非 root 跑而 `/app` 归 root 时，这一行在 import 阶段就抛 `PermissionError`，容器直接退出，日志里只有一行 Traceback。这是本项目最容易踩的 Docker 坑 |
+| **只拷 Web 需要的文件，排除 `batch.py`** | `batch.py` 依赖 pandas，而 Web 镜像装的是 `requirements-web.txt`（不含 pandas，体积小很多）。已验证导入 `app` 时 pandas 和 batch 都不会被加载（`import batch` 在 `run_batch()` 内部，是延迟导入）。代价是容器里跑不了 `python main.py --input`——那是 CLI 的活，用本地环境跑 |
+
+**另外两个细节**
+
+- `PYTHONUNBUFFERED=1`：不加的话 stdout 被缓冲，`docker logs` 看不到实时输出，出问题只能等进程退出才刷出来
+- 健康检查不装 curl（slim 镜像没有），直接用 `python -c` 打 `/api/health`；`CMD` 用 shell 形式才能展开 `${PORT}`
+
 ### 公开之前先想一件事
 
 **别人用的是你的 API 额度。** 目前的口子是每 IP 每天 20 次 + 全站每天 300 次（`app.py` 顶部改）。按 `deepseek-v4.1-flash` 的价格，全站刷满一天也就是几毛钱，可接受；但如果你换成贵模型，先把 `MAX_CALLS_PER_DAY_GLOBAL` 调小再发链接。
@@ -805,6 +832,9 @@ ai-summary-bot/
 ├── docs/
 │   └── screenshots/         # 运行截图（结果页、Agent trace、知识库）
 ├── render.yaml              # Render 部署配置（Blueprint，一键建服务）
+├── Dockerfile               # 生产镜像：非 root + 依赖分层 + 健康检查
+├── docker-compose.yml       # 起服务 + 命名卷挂知识库（数据不随容器消失）
+├── .dockerignore            # 排除 .env / .venv / corpus / 测试与文档
 ├── build_corpus.py          # 数据准备：corpus/*.txt → data.csv
 ├── fetch_corpus.py          # 语料采集：从公开接口补够 30 篇（带节流与清洗）
 ├── sample.txt               # 示例文本
@@ -933,7 +963,8 @@ return cls(api_key=key, api_url=normalize_api_url(base_url), model=model)
 - [ ] 检索是纯向量，没有做**混合检索**（关键词 BM25 + 向量加权）。专有名词、编号这类查询，纯向量的召回不如关键词
 - [ ] 没有 rerank。top_k 取回来就这顺序，加一层 cross-encoder 重排通常还能再提一截
 - [ ] 切片参数（400 字 / 80 字重叠）是拍的，没做消融对比。要做成"能讲数据"的部分，得跑几组参数看召回率
-- [ ] 知识库存在本地 sqlite，线上重新部署即清空（`/tmp` 临时目录）→ 接对象存储做冷启动预热
+- [x] ~~知识库存在本地 sqlite，线上重新部署即清空~~ → 给了 Docker 方案（`docker-compose.yml` 里 `kb-data:/data` 命名卷），容器重启/重建数据都在；但 Render 免费档仍只能用 `/tmp`，那条路要挂磁盘或接对象存储
+- [ ] Docker 镜像尚未在本机 build 验证（开发机没装 Docker），首次有 Docker 的机器上需先跑通再写进材料
 - [ ] 流式链路不做句数纠正（重写会把已显示的内容整段替换），句数不准时只能提示 → 需要严格句数请用同步接口
 - [ ] 流式没有做"中途取消"的服务端处理：前端 abort 后，上游那条连接要等模型自己结束才会释放 → 接 `request.is_disconnected()` 主动断开
 
@@ -955,6 +986,7 @@ return cls(api_key=key, api_url=normalize_api_url(base_url), model=model)
 | **v2.0** | **Agent 工具调用**：工具注册表 + 多步循环 + 步数上限 + trace 可视化（`/agent` 页面 + `POST /api/agent`） |
 | **v2.1** | **知识库向量检索**：切片 + 1024 维向量 + sqlite BLOB 存储 + 余弦检索，`/kb` 页面，并作为 `search_kb` 工具接进 Agent |
 | **v2.2** | **服务端流式**：`chat_stream()` + SSE 解析 + `/api/summarize/stream` + 前端逐字渲染；只重试建连、错误前置，流式不做句数重写 |
+| **v2.3** | **容器化**：Dockerfile（非 root + 依赖分层 + python 健康检查）+ compose 命名卷挂知识库。镜像 build 待有 Docker 的机器补验 |
 
 > 提交粒度：一个功能一个分支（`feature/xxx`），完成后用 `--no-ff` 合并回 `main`，保留完整的合并记录。
 

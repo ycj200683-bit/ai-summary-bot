@@ -1,0 +1,51 @@
+# docker compose up -d --build
+#
+# 为什么要有 compose 而不是只给个 Dockerfile：
+#   Dockerfile 解决"怎么把程序装进容器"，但容器一删，里面写的数据就没了。
+#   知识库（sqlite 文件）必须放在容器之外的卷上，重新部署才不会丢——
+#   这正是项目「已知限制」里那条"知识库重部署即清空"的正解。
+#   一个 docker run 的长命令也能挂卷，但记不住、容易漏、没法进版本库，
+#   所以用 compose 把"镜像 + 端口 + 环境 + 卷"一次写清楚。
+
+services:
+  app:
+    build: .
+    image: ai-summary-bot:local
+    container_name: ai-summary-bot
+
+    ports:
+      # 左边是宿主机端口，嫌 8000 被占用改左边就行，右边是容器内的 PORT
+      - "8000:8000"
+
+    # ★ 密钥走 env_file，不要写进这里。
+    #   这个文件是要进 git 的，写进去等于把 API_KEY 推到 GitHub。
+    #   没有 .env 的话先 cp .env.example .env 再填。
+    env_file:
+      - .env
+
+    environment:
+      # 知识库落到卷上（对应下面 volumes 的挂载点）
+      KB_DIR: /data
+      PORT: "8000"
+      # 摘要不需要推理链，关掉明显更快
+      DISABLE_THINKING: "1"
+
+    volumes:
+      # ★ 命名卷而不是 bind mount：
+      #   命名卷由 docker 管理，Windows/macOS 上不用操心路径和权限；
+      #   bind mount 到宿主机目录在 Windows 上经常遇到属主映射问题，
+      #   上面 Dockerfile 里辛苦设的 appuser 权限会被宿主机覆盖掉。
+      - kb-data:/data
+
+    # 进程挂了自动重启；docker stop 时不会重启（否则停不下来）
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/api/health' % os.getenv('PORT','8000'), timeout=2).status == 200 else 1)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  kb-data:
