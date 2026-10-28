@@ -72,6 +72,7 @@ v0.2 变化：
 
 import os
 import re
+import json
 import time
 import functools
 import argparse
@@ -309,19 +310,7 @@ class LLMClient:
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
-            "model": self.config.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": self.config.temperature,
-        }
-
-        # 关掉深度思考：模型不用先"想一大段"再回答。
-        # 只在该开关打开时才加这个字段——不认识的字段有些服务商会直接 400。
-        if self.config.disable_thinking:
-            payload["enable_thinking"] = False
+        payload = self._build_payload(system_prompt, user_prompt)
 
         try:
             resp = requests.post(
@@ -336,6 +325,19 @@ class LLMClient:
             raise RetryableError(f"网络出错，可以重试：{e}") from None
 
         # 到这说明请求发出去了，看返回码
+        self._raise_for_status(resp)
+
+        # 一切正常：从 JSON 里把模型说的话取出来
+        return resp.json()["choices"][0]["message"]["content"]
+
+    def _raise_for_status(self, resp) -> None:
+        """
+        把 HTTP 返回码翻译成项目自己的异常。
+
+        ★ 为什么单独抽出来：同步和流式两条链路要共用同一套错误语义。
+          复制一遍的话，以后改了一处忘了另一处，就成了"同步链路会说人话、
+          流式链路只会甩 400"——这种不一致排查起来最费劲。
+        """
         if resp.status_code == 429:
             raise RetryableError("429 被限流了，等一会儿可以重试")
         if resp.status_code in (401, 403):
@@ -356,8 +358,114 @@ class LLMClient:
         if resp.status_code >= 400:
             raise FatalError(f"{resp.status_code} 请求有问题：{resp.text[:200]}")
 
-        # 一切正常：从 JSON 里把模型说的话取出来
-        return resp.json()["choices"][0]["message"]["content"]
+    def _build_payload(self, system_prompt: str, user_prompt: str, stream: bool = False) -> dict:
+        """同步和流式共用的请求体。两处拼一遍很容易写着写着就不一致了。"""
+        payload = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": self.config.temperature,
+        }
+        # 关掉深度思考：模型不用先"想一大段"再回答。
+        # 只在该开关打开时才加这个字段——不认识的字段有些服务商会直接 400。
+        if self.config.disable_thinking:
+            payload["enable_thinking"] = False
+        if stream:
+            payload["stream"] = True
+        return payload
+
+    def chat_stream(self, system_prompt: str, user_prompt: str, max_tries: int = 2):
+        """
+        流式对话：模型每吐一小段就 yield 出去，不用等整段生成完。
+
+        ★★ 为什么这个方法不能像 chat() 那样直接套 @retry：
+           @retry 只能重试"函数调用"，而生成器的函数体要到真正迭代时才执行。
+           更深一层的原因是语义问题：一旦已经 yield 出去几段，这时再重试，
+           用户会先看到半句话、然后这句话又从头上再来一遍——内容重复且错误。
+           所以策略是：**只重试"把连接建起来"这一步**（发请求 + 检查状态码），
+           一旦开始收数据就不重试，出错就如实抛出，由上层决定怎么提示。
+
+        ★ 为什么 max_tries 默认 2 而不是 3：
+          流式的首字延迟本来就是用户在等的成本，重试越多，用户越觉得页面卡死。
+           宁可两次失败后直接报错，也别让人盯着一个不动的光标干等。
+        """
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = self._build_payload(system_prompt, user_prompt, stream=True)
+
+        resp = None
+        last_err: Exception | None = None
+        for attempt in range(1, max_tries + 1):
+            try:
+                resp = requests.post(
+                    self.config.api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.config.timeout,
+                    stream=True,          # ★ 不把响应体一次性读完，交给 iter_lines 边到边处理
+                )
+                self._raise_for_status(resp)   # 建连成功但状态码不对 → 这里抛，仍可重试
+                last_err = None
+                break
+            except (RetryableError, FatalError) as e:
+                last_err = e
+                if isinstance(e, FatalError):
+                    raise              # 401/402 这类重试也没用，立刻失败
+                if resp is not None:
+                    resp.close()
+                if attempt < max_tries:
+                    time.sleep(1.0 * attempt)
+
+        if last_err is not None:
+            raise last_err
+
+        try:
+            yield from self._iter_sse(resp)
+        finally:
+            resp.close()               # 一定关：不关会留着一条没读完的连接
+
+    @staticmethod
+    def _iter_sse(resp):
+        """
+        解析 OpenAI 兼容的 SSE 流，逐段 yield 文本增量。
+
+        协议长这样（一行一条，空行分隔）：
+            data: {"choices":[{"delta":{"content":"你"}}]}
+            data: {"choices":[{"delta":{"content":"好"}}]}
+            data: [DONE]
+
+        ★ 三个容易踩的点：
+          1) 首包和末包的 delta 里可能没有 content（比如只有 role 或 finish_reason），
+             不能直接 ["content"]，会 KeyError。
+          2) 空行要跳过，不是数据。
+          3) 有的服务商会插心跳/注释行（以 ':' 开头），也要跳过。
+        """
+        for raw in resp.iter_lines():
+            if not raw:
+                continue
+            line = raw.decode("utf-8", "ignore") if isinstance(raw, bytes) else raw
+            if line.startswith(":"):          # 注释/心跳
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue                       # 半包/异常包，跳过而不是崩掉
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            piece = delta.get("content")
+            if piece:
+                yield piece
 
 
 # ============================================================
@@ -524,6 +632,45 @@ class Summarizer:
             f"只输出摘要正文，不要解释。"
         )
         return normalize_summary(self.client.chat(system, user + "\n\n" + fix))
+
+    def summarize_stream(self, text: str):
+        """
+        流式版本的 summarize：模型吐一段，这里就往外 yield 一段。
+
+        和 summarize() 有两处刻意不同，都是流式本身决定的，不是偷懒：
+
+        ① **不做"句数不符就重写一次"**。
+           重写意味着从头再说一遍。用户已经盯着屏幕看过的前半句会突然被
+           整段替换掉，体验比"句数少一句"糟糕得多。所以流式只保证"内容对"，
+           句数不达标时在收尾事件里如实告知实际句数，让前端置灰提示。
+
+        ② **句数收窄照旧，但必须在吐字之前算完**。
+           收窄结果会写进提示词（"请写正好 N 句"），如果等到收完再算，
+           提示词早就发出去了，改不了。
+
+        调用方拿到的是增量片段；收完后请把拼起来的全文交给 finalize_summary()，
+        保证和同步链路输出同一种排版。
+        """
+        self.sentences_used = min(self.max_sentences, max_reasonable_sentences(len(text)))
+        if self.sentences_used != self.max_sentences:
+            logger.info(
+                "📏 正文 %d 字，%d 句会拆碎，按 %d 句生成（你要求的是 %d 句）",
+                len(text), self.max_sentences, self.sentences_used, self.max_sentences,
+            )
+
+        system, user = self._build_prompt(text)
+        yield from self.client.chat_stream(system, user)
+
+    def finalize_summary(self, raw: str) -> str:
+        """
+        收尾规整：把流式拼起来的全文变成和 summarize() 一样的排版。
+
+        ★ 为什么流式也要走一遍 normalize_summary：
+          过程是"边吐边显示"，模型仍可能吐出 "- 第一句" 这类列表符和多余空行。
+          如果只在同步链路上规整，同一个接口会出现两种排版，
+          前端 CSS 也得写两套。收尾统一处理一次，代价可以忽略。
+        """
+        return normalize_summary(raw)
 
 
 # ============================================================

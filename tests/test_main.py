@@ -466,3 +466,152 @@ def test_summarize_返回值已经规整过():
 
     bot = Summarizer(FakeClient(), max_sentences=3)
     assert bot.summarize("字" * 800) == "一。二。三。"
+
+
+
+# ============================================================
+# 流式（v2.2）：SSE 解析 + 只重试"建连"不重试"已开始吐字"
+# ============================================================
+def _s(line: str) -> bytes:
+    """SSE 的每一行都是 UTF-8 字节。bytes 字面量不能直接写中文，所以统一走这里编码。"""
+    return line.encode("utf-8")
+
+
+class _FakeStreamResp:
+    """假的流式响应：只要能 iter_lines 和 close 就够被测代码用了。"""
+
+    def __init__(self, lines, status_code=200, text=""):
+        self._lines = lines
+        self.status_code = status_code
+        self.text = text
+        self.closed = False
+
+    def iter_lines(self):
+        return iter(self._lines)
+
+    def close(self):
+        self.closed = True
+
+
+def test_iter_sse_跳过心跳与没有content的增量():
+    """
+    真实 SSE 流里有一堆"不是正文"的东西：空行、心跳注释、只有 role 的首包。
+    这些要是当成正文塞进摘要，用户就会看到一段莫名其妙的东西。
+    """
+    lines = [
+        _s(""),
+        _s(": keep-alive"),
+        _s('data: {"choices":[{"delta":{"role":"assistant"}}]}'),
+        _s('data: {"choices":[{"delta":{"content":"你好"}}]}'),
+        _s('data: {"choices":[{"delta":{"content":"，世界"}}]}'),
+        _s("data: [DONE]"),
+    ]
+    assert list(LLMClient._iter_sse(_FakeStreamResp(lines))) == ["你好", "，世界"]
+
+
+def test_iter_sse_遇到坏json继续而不是崩掉():
+    # 半包、上游异常都可能吐出非法 JSON。一条坏包不该让整次请求失败。
+    lines = [
+        _s('data: {"choices":[{"delta":{"content":"正常"}}]}'),
+        _s("data: {这行不是合法 JSON"),
+        _s("data: {"),
+        _s('data: {"choices":[{"delta":{"content":"继续"}}]}'),
+        _s("data: [DONE]"),
+    ]
+    assert list(LLMClient._iter_sse(_FakeStreamResp(lines))) == ["正常", "继续"]
+
+
+def test_iter_sse_收到_DONE_就停():
+    # [DONE] 之后可能还有垃圾，不该继续产出
+    lines = [
+        _s('data: {"choices":[{"delta":{"content":"第一段"}}]}'),
+        _s("data: [DONE]"),
+        _s('data: {"choices":[{"delta":{"content":"这行不该出现"}}]}'),
+    ]
+    assert list(LLMClient._iter_sse(_FakeStreamResp(lines))) == ["第一段"]
+
+
+def test_chat_stream_401_立即失败且只请求一次(clean_env, monkeypatch):
+    """和同步链路同一条规矩：key 不对重试一百次也一样，别让用户干等。"""
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs)
+        return _FakeStreamResp([], status_code=401, text="bad key")
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+
+    with pytest.raises(FatalError):
+        list(LLMClient(Config(api_key="k")).chat_stream("sys", "user"))
+
+    assert len(calls) == 1, "401 不该重试"
+    assert calls[0].get("stream") is True, "流式链路必须带 stream=True"
+
+
+def test_chat_stream_5xx_重试到上限才失败(clean_env, monkeypatch):
+    """
+    5xx 属于可重试错误，但流式的重试上限要比同步更保守。
+
+    ★ 这里断言的是 2 次而不是 3 次：流式的首字延迟直接就是用户在等的成本，
+      多等一轮退避，用户只会觉得页面卡死了。宁可早点报错让他重点一次。
+    """
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(1)
+        return _FakeStreamResp([], status_code=503, text="boom")
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+
+    with pytest.raises(RetryableError):
+        list(LLMClient(Config(api_key="k")).chat_stream("sys", "user", max_tries=2))
+
+    assert len(calls) == 2
+
+
+def test_chat_stream_正常路径把增量按顺序拼出来(clean_env, monkeypatch):
+    lines = [
+        _s('data: {"choices":[{"delta":{"content":"第一句。"}}]}'),
+        _s('data: {"choices":[{"delta":{"content":"第二句。"}}]}'),
+        _s("data: [DONE]"),
+    ]
+
+    def fake_post(*args, **kwargs):
+        return _FakeStreamResp(lines)
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+
+    out = list(LLMClient(Config(api_key="k")).chat_stream("sys", "user"))
+    assert out == ["第一句。", "第二句。"]
+    assert "".join(out) == "第一句。第二句。"
+
+
+def test_summarize_stream_不做重写_只收窄句数():
+    """
+    流式刻意不实现"句数不符就重写一次"：重写会让用户已经读到的内容整段被替换。
+
+    这里用一个只吐 2 句的假客户端，要求 5 句，验证两件事：
+      ① 句数收窄照旧生效（提示词里的句数是对的）
+      ② 不会触发第二次调用
+    """
+    calls = []
+
+    class FakeClient:
+        def chat_stream(self, system, user):
+            calls.append((system, user))
+            yield "第一句。"
+            yield "第二句。"
+
+    bot = Summarizer(FakeClient(), max_sentences=5)
+    got = list(bot.summarize_stream("字" * 800))     # 800 字 → 句数上限 4
+
+    assert got == ["第一句。", "第二句。"]
+    assert len(calls) == 1, "流式不该重写"
+    system, _user = calls[0]
+    assert f"{bot.sentences_used} 句" in system, "提示词里要写收窄后的句数"
+    assert bot.sentences_used == 4
+
+
+def test_finalize_summary_和同步链路同一种排版():
+    bot = Summarizer(object(), max_sentences=3)
+    assert bot.finalize_summary("- 一。\n\n- 二。") == "一。二。"

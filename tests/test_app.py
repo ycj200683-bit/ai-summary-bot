@@ -15,6 +15,7 @@ tests/test_app.py —— Web 层（app.py）的测试：限流、IP 解析、请
 """
 
 import os
+import json
 from array import array
 
 import pytest
@@ -45,6 +46,15 @@ class FakeSummarizer:
 
     def summarize(self, text: str) -> str:
         return "第一句。第二句。"
+
+    # 流式链路要用的两个方法。替身也得有，否则 /api/summarize/stream
+    # 一跑就 AttributeError——那是测试替身不完整，不是被测代码有问题。
+    def summarize_stream(self, text: str):
+        yield "第一句。"
+        yield "第二句。"
+
+    def finalize_summary(self, raw: str) -> str:
+        return raw.strip()
 
 
 @pytest.fixture(autouse=True)
@@ -320,4 +330,72 @@ def test_kb_delete_missing_doc_returns_404(client, kb_env):
 
 def test_kb_upload_empty_text_is_rejected(client, kb_env):
     r = client.post("/api/kb/upload", json={"name": "空文档.txt", "text": ""})
+    assert r.status_code == 422
+
+
+# ============================================================
+# 7) 流式接口：事件格式、错误前置、扣费时机
+# ============================================================
+def _sse_events(resp_text: str) -> list[dict]:
+    """把 SSE 响应体拆成事件列表，方便断言。"""
+    out = []
+    for line in resp_text.splitlines():
+        if line.startswith("data:"):
+            out.append(json.loads(line[5:].strip()))
+    return out
+
+
+def test_stream_接口返回_sse_并能逐个事件读出(client):
+    r = client.post("/api/summarize/stream", json={"text": "一段用来测试的正文。", "length": 3})
+
+    assert r.status_code == 200
+    # 媒体类型必须是 text/event-stream，否则浏览器不会按流处理
+    assert r.headers["content-type"].startswith("text/event-stream")
+    # 反代缓冲会让"流式"名存实亡，这个头必须带上
+    assert r.headers.get("x-accel-buffering") == "no"
+
+    events = _sse_events(r.text)
+    deltas = [e["delta"] for e in events if "delta" in e]
+
+    # 替身吐两段，就应该收到两个 delta 事件，而不是攒成一段
+    assert deltas == ["第一句。", "第二句。"]
+    assert "".join(deltas) == "第一句。第二句。"
+
+    done = events[-1]
+    assert done["done"] is True, "最后一个事件必须是收尾汇总"
+    assert done["summary"] == "第一句。第二句。"
+    for key in ("latency_ms", "input_chars", "model", "remaining", "sentences_used"):
+        assert key in done, f"收尾事件缺字段：{key}"
+
+
+def test_stream_空白正文返回_400_且不扣额度(client):
+    """
+    流式最容易踩的坑：错误发生在开始推流之后就改不了状态码。
+    所以校验必须前置。这里验证两件事：状态码仍是 400，且没有白扣额度。
+    """
+    before = client.get("/api/health").json()["used_today_global"]
+
+    r = client.post("/api/summarize/stream", json={"text": "   ", "length": 3})
+    assert r.status_code == 400
+
+    after = client.get("/api/health").json()["used_today_global"]
+    assert after == before, "空白正文被拒了，却还是扣了一次额度"
+
+
+def test_stream_只扣一次额度(client):
+    before = client.get("/api/health").json()["used_today_global"]
+
+    r = client.post("/api/summarize/stream", json={"text": "一段用来测试的正文。", "length": 3})
+    assert r.status_code == 200
+
+    after = client.get("/api/health").json()["used_today_global"]
+    assert after == before + 1, "流式一次请求应该只扣一次额度"
+
+
+def test_stream_入参校验和同步接口一致(client):
+    # 超长正文、越界句数都应该在进业务代码之前被拦掉
+    r = client.post("/api/summarize/stream", json={"text": "字" * (app_module.MAX_CHARS + 1), "length": 3})
+    assert r.status_code == 422
+
+    r = client.post("/api/summarize/stream", json={"text": "正常正文。", "length": 9})
     assert r.status_code == 422
