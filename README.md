@@ -336,6 +336,43 @@ data: {"done":true,"summary":"青海湖是中国最大的内陆咸水湖……",
 
 > `/api/health` 会返回 `quota_scope: "process-memory"`，部署时一眼能看到当前实例的计数口径。
 
+### 「那你怎么换成 Redis？」——口述版
+
+`/api/health` 里明写了 `quota_scope: "process-memory"`，这就是主动把问题摊开。面试官看到这一行一定会问："多实例怎么办？"答不上来就是自己给自己挖坑，所以这里把话说完整。
+
+**现在的实现**：`_usage`（每 IP 当天计数）+ `_global`（全站计数）两个模块级结构，用 `threading.Lock` 包住"读—判断—写"。
+
+**换成 Redis 要动的其实只有三处**：
+
+```python
+# ① 扣额度：从"读内存"改成"原子自增"
+pipe = r.pipeline()
+pipe.incr(f"quota:ip:{ip}:{today}")
+pipe.expire(f"quota:ip:{ip}:{today}", 86400)
+pipe.incr(f"quota:global:{today}")
+pipe.expire(f"quota:global:{today}", 86400)
+ip_used, _, global_used, _ = pipe.execute()
+
+# ② 判断超限：INCR 返回的是"加完之后"的值，天然没有竞态
+if ip_used > MAX_CALLS_PER_DAY or global_used > MAX_CALLS_PER_DAY_GLOBAL:
+    r.decr(...)              # 超了要把刚才加的退回去
+    raise HTTPException(429, "今日额度用完")
+
+# ③ 清理过期 IP：不用再自己扫，靠 key 的 EXPIRE 到期自动消失
+```
+
+**关键点，也是真正会被追问的地方：**
+
+| 点 | 说明 |
+|---|---|
+| **INCR 是原子的** | 现在的 `Lock` 只能在单进程内挡并发，多 worker 时每个进程各持一把锁，等于没有。Redis 的 `INCR` 单命令原子，多实例安全 |
+| **"先加再判断"而不是"先判断再加"** | 先 GET 再 SET 存在竞态窗口。先 INCR 拿到加完的值再判断，超了回退，才不会出现"20 个并发全放行" |
+| **用 EXPIRE 代替自己扫表** | 现在 `_sweep_locked()` 每天清一次过期 IP，换成 Redis 后 key 自己会过期，这段逻辑整段删掉 |
+| **Redis 挂了怎么办** | 这是必须主动说的：要么 fail-open（放行，但要告警），要么 fail-closed（全站 503）。公开 Demo 选 fail-open，因为限流是为了省钱不是安全边界 |
+| **降级路径** | `QUOTA_BACKEND=memory\|redis` 一个环境变量切换，Redis 连不上自动回落到进程内存并打警告——本地开发和 CI 不用装 Redis |
+
+**为什么现在不换**：单实例部署下进程内存是**准确**的，Redis 只会多一个故障点和一个运维依赖。规模没到就先不加——这是取舍，不是不会。
+
 ---
 
 ## 流式输出（SSE）
