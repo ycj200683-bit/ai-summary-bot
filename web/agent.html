@@ -101,6 +101,15 @@
     margin-top: 7px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 12px; color: #4b5563; white-space: pre-wrap; word-break: break-all;
   }
+  /* 工具返回值：用绿色区分"输入"和"输出"，扫一眼就知道这步产出了什么 */
+  .result {
+    margin-top: 6px; padding-top: 6px; border-top: 1px dashed #e5e7eb;
+    font-size: 12.5px; color: #065f46; word-break: break-all;
+  }
+  .result-label { font-weight: 600; margin-right: 6px; color: #047857; }
+  .result-text {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
   .err { margin-top: 6px; font-size: 12.5px; color: #b91c1c; }
 
   /* ---- 结果 ---- */
@@ -226,6 +235,13 @@
       const args = JSON.stringify(s.args || {}, null, 0);
       body.appendChild(el("div", "args", args.length > 220 ? args.slice(0, 220) + " …" : args));
 
+      // 工具结果预览：只有参数没有返回值，看的人不知道"它算出了什么"。
+      if (s.ok && s.result) {
+        const res = el("div", "result");
+        res.appendChild(el("span", "result-label", "→ 返回"));
+        res.appendChild(el("span", "result-text", s.result));
+        body.appendChild(res);
+      }
       if (!s.ok && s.error) body.appendChild(el("div", "err", s.error));
 
       item.appendChild(body);

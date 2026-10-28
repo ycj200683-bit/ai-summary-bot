@@ -170,6 +170,16 @@ def execute_tool(name: str, args: dict) -> dict:
                 "elapsed_ms": round((time.time() - started) * 1000)}
 
 
+def _preview(value, limit: int = 160) -> str:
+    """把工具返回值压成一行可读的预览，供 trace 展示用。"""
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False)
+    else:
+        text = str(value)
+    text = text.replace("\n", " ").strip()
+    return text if len(text) <= limit else text[:limit] + " …"
+
+
 # ============================================================
 # 2) 调用模型：要能传 tools，所以不能用 chat()（它只返回纯文本）
 # ============================================================
@@ -281,6 +291,9 @@ def run_agent(user_input: str, client_factory, max_steps: int = 6,
                 "args": args,
                 "ok": result.get("ok", False),
                 "elapsed_ms": result.get("elapsed_ms"),
+                # 结果也留一份预览：只有参数没有返回值，看的人不知道工具到底算出了什么。
+                # 截断 160 字是为了 trace 面板不被一整段长文撑爆。
+                "result": _preview(result.get("result")) if result.get("ok") else None,
                 **({"error": result["error"]} if not result.get("ok") else {}),
             })
 

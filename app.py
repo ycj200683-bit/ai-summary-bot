@@ -117,6 +117,9 @@ class AgentStep(BaseModel):
     args: dict
     ok: bool
     elapsed_ms: int | None = None
+    # 工具返回值的预览。前端把它显示在参数下面，
+    # 看的人才知道"这个工具到底算出了什么"，而不只是"它被调用了"。
+    result: str | None = None
     error: str | None = None
 
 
