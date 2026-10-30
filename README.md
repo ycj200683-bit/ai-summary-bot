@@ -23,6 +23,7 @@
 | **trace 可视化** | 每步记录工具名 / 参数 / 返回值 / 耗时 / 成败，在 `/agent` 页面渲染成时间线 |
 | **知识库向量检索** | 文档切片 → 1024 维向量 → 存 sqlite → 余弦相似度检索，在 `/kb` 页面入库和试检索，并作为工具供 Agent 调用 |
 | **流式输出（SSE）** | `POST /api/summarize/stream` 边生成边推，首字 842ms（整段 948ms）；只重试"建连"、重试上限比同步更保守 |
+| **容器化部署** | Dockerfile 非 root 运行 + compose 命名卷挂知识库；实测 `compose down/up` 后文档与向量仍在 |
 | 失败可被脚本感知 | 成功退出码 `0`、失败 `1`，可以直接用在 shell 脚本 / CI 里判断 |
 
 ---
@@ -756,9 +757,26 @@ docker compose down               # 停（数据留在卷里，不会丢）
 
 访问 `http://127.0.0.1:8000`。密钥从 `.env` 读（`env_file`），不写进 compose。
 
-> ⚠️ **验证状态要说清楚**：这个镜像**还没在本机 build 过**——开发机上没装 Docker（`docker` 命令不存在），所以 `docker build` 这一步没有实跑。
-> 已经在等价环境验证过的是**应用层行为**：`PORT` 从外部注入、`KB_DIR` 指向独立目录、杀掉进程重启后知识库仍在（doc_id 与向量都在，检索分数 0.6154），以及导入 `app` 时不会加载 pandas/batch。
-> 也就是说：**能验证的是"这个容器该怎么跑才对"，没验证的是"build 那一步能不能过"**。首次在有 Docker 的机器上务必先跑一遍再写进任何材料。
+> ✅ **验证状态：已在本机真实 build 并跑通**（Docker Desktop 4.97 / Engine 29.9.2 / WSL2 后端）
+>
+> | 验证项 | 结果 |
+> |---|---|
+> | `docker build` | 成功，镜像 206 MB |
+> | `docker compose up -d` | 容器 `Up (healthy)`，healthcheck 生效 |
+> | `/api/health` | 200，`configured: true`（`.env` 正确注入） |
+> | `/api/summarize/stream` | `text/event-stream`，首字 468 ms，6 个增量 |
+> | 知识库入库 | 写入卷 `/data/kb.sqlite3`（36864 字节） |
+> | `compose down` → `up` | **文档与向量仍在**，检索 0.4254 |
+> | 运行用户 | `uid=10001(appuser)`，非 root |
+> | `/app/logs/app.log` | 归 appuser，权限问题未发生 |
+
+**拉不到 Docker Hub 时的做法**（本机实测，国内网络常见）：`registry-1.docker.io` 会超时，而 Docker Desktop 默认没有 HTTPS 代理。绕法是先从国内镜像源拉基础镜像再打回原名，Docker 见到本地已有同名 tag 就不会再去 Hub 拉：
+
+```bash
+docker pull docker.m.daocloud.io/library/python:3.12-slim
+docker tag docker.m.daocloud.io/library/python:3.12-slim python:3.12-slim
+docker build -t ai-summary-bot:local .      # 之后正常 build
+```
 
 **三个必须这么写的理由**
 
@@ -964,7 +982,7 @@ return cls(api_key=key, api_url=normalize_api_url(base_url), model=model)
 - [ ] 没有 rerank。top_k 取回来就这顺序，加一层 cross-encoder 重排通常还能再提一截
 - [ ] 切片参数（400 字 / 80 字重叠）是拍的，没做消融对比。要做成"能讲数据"的部分，得跑几组参数看召回率
 - [x] ~~知识库存在本地 sqlite，线上重新部署即清空~~ → 给了 Docker 方案（`docker-compose.yml` 里 `kb-data:/data` 命名卷），容器重启/重建数据都在；但 Render 免费档仍只能用 `/tmp`，那条路要挂磁盘或接对象存储
-- [ ] Docker 镜像尚未在本机 build 验证（开发机没装 Docker），首次有 Docker 的机器上需先跑通再写进材料
+- [x] ~~Docker 镜像尚未在本机 build 验证~~ → 已在本机 build 并跑通：容器 healthy、流式可用、`compose down/up` 后知识库仍在、运行用户为 uid 10001 非 root
 - [ ] 流式链路不做句数纠正（重写会把已显示的内容整段替换），句数不准时只能提示 → 需要严格句数请用同步接口
 - [ ] 流式没有做"中途取消"的服务端处理：前端 abort 后，上游那条连接要等模型自己结束才会释放 → 接 `request.is_disconnected()` 主动断开
 
@@ -986,7 +1004,7 @@ return cls(api_key=key, api_url=normalize_api_url(base_url), model=model)
 | **v2.0** | **Agent 工具调用**：工具注册表 + 多步循环 + 步数上限 + trace 可视化（`/agent` 页面 + `POST /api/agent`） |
 | **v2.1** | **知识库向量检索**：切片 + 1024 维向量 + sqlite BLOB 存储 + 余弦检索，`/kb` 页面，并作为 `search_kb` 工具接进 Agent |
 | **v2.2** | **服务端流式**：`chat_stream()` + SSE 解析 + `/api/summarize/stream` + 前端逐字渲染；只重试建连、错误前置，流式不做句数重写 |
-| **v2.3** | **容器化**：Dockerfile（非 root + 依赖分层 + python 健康检查）+ compose 命名卷挂知识库。镜像 build 待有 Docker 的机器补验 |
+| **v2.3** | **容器化**：Dockerfile（非 root + 依赖分层 + python 健康检查）+ compose 命名卷挂知识库；已在本机 build 并验证容器重建后数据不丢 |
 
 > 提交粒度：一个功能一个分支（`feature/xxx`），完成后用 `--no-ff` 合并回 `main`，保留完整的合并记录。
 
