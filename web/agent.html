@@ -115,6 +115,21 @@
   /* ---- 结果 ---- */
   .answer { font-size: 15px; line-height: 1.8; white-space: pre-wrap; color: #111827; }
   .empty { color: #9ca3af; font-size: 14px; }
+
+  /* 历史列表：一行一次运行，点击回看轨迹 */
+  .hist-row {
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+    padding: 9px 10px; border-radius: 8px; cursor: pointer;
+    border-bottom: 1px solid #f3f4f6; transition: background .12s;
+  }
+  .hist-row:hover { background: #f9fafb; }
+  .hist-row:last-child { border-bottom: none; }
+  .hist-id { font-size: 12px; font-weight: 700; color: #4338ca;
+             font-variant-numeric: tabular-nums; min-width: 34px; }
+  .hist-time, .hist-steps { font-size: 12px; color: #9ca3af;
+                            font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .hist-q { font-size: 13px; color: #374151; flex: 1 1 200px; }
+  .hint-line { font-size: 13px; color: #9ca3af; margin-bottom: 10px; }
   .alert {
     background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c;
     border-radius: 10px; padding: 12px 14px; font-size: 14px; margin-bottom: 16px;
@@ -168,6 +183,14 @@
   <div class="card">
     <h2>最终回答</h2>
     <div id="answer" class="answer empty">等待执行……</div>
+  </div>
+
+  <!-- 历史记录：trace 落库之后才有的能力。
+       以前刷新页面就全丢了，现在每次运行都存了一份，可以回看。 -->
+  <div class="card">
+    <h2>历史记录<span class="meta" id="hist-meta"></span></h2>
+    <p class="hint-line">每次运行都已落库，刷新后仍可查。点任意一条可回看它的执行轨迹。</p>
+    <div id="history"><p class="empty">加载中……</p></div>
   </div>
 </div>
 
@@ -316,6 +339,9 @@
       if (data.hit_max_steps) {
         showAlert("触发了最大步数保护：模型想继续调工具，但被安全闸挡住。可以调大最大步数或把任务描述得更具体。");
       }
+
+      // 落库成功才刷新历史；run_id 为 -1 表示这次没存下来（后端不让它影响主流程）
+      if (data.run_id > 0) loadHistory();
     } catch (e) {
       showAlert("网络或服务异常：" + e.message);
       answerEl.textContent = "本次没有结果。";
@@ -331,6 +357,69 @@
   queryEl.addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") run();
   });
+
+  /* ============================================================
+   * 历史记录：读 /api/agent/runs，点一条就回看那次执行
+   * ★ 这里也用 textContent 渲染，不拼 HTML——指令是用户输入。
+   * ============================================================ */
+  const histEl = $("history");
+  const histMeta = $("hist-meta");
+
+  async function loadHistory() {
+    try {
+      const resp = await fetch("/api/agent/runs?limit=10");
+      const data = await resp.json();
+      histEl.textContent = "";
+      histMeta.textContent = "";
+
+      if (!data.count) {
+        histEl.appendChild(el("p", "empty", "还没有历史记录，跑一次就有了。"));
+        return;
+      }
+      histMeta.textContent = "（最近 " + data.count + " 条）";
+
+      data.runs.forEach((run) => {
+        const row = el("div", "hist-row");
+        row.appendChild(el("span", "hist-id", "#" + run.id));
+        row.appendChild(el("span", "hist-time", run.created_at));
+        row.appendChild(el("span", "hist-steps", run.n_steps + " 步 · " + run.elapsed_ms + " ms"));
+        row.appendChild(el("span", "hist-q", run.query));
+        row.title = "点击回看这次执行轨迹";
+        row.addEventListener("click", () => loadRunDetail(run.id));
+        histEl.appendChild(row);
+      });
+    } catch (e) {
+      histEl.textContent = "";
+      histEl.appendChild(el("p", "empty", "历史加载失败：" + e.message));
+    }
+  }
+
+  async function loadRunDetail(id) {
+    try {
+      const resp = await fetch("/api/agent/runs/" + id);
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const data = await resp.json();
+      const run = data.run;
+
+      renderTrace(run.trace);
+      answerEl.textContent = run.answer;
+      answerEl.className = "answer";
+      metaEl.textContent = [
+        "历史记录 #" + run.id,
+        run.created_at,
+        "共 " + run.n_steps + " 步",
+        "服务端耗时 " + run.elapsed_ms + " ms",
+        "模型 " + (run.model || "未知"),
+      ].join(" ｜ ");
+
+      clearAlert();
+      $("result-card").scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) {
+      showAlert("加载记录 #" + id + " 失败：" + e.message);
+    }
+  }
+
+  loadHistory();
 })();
 </script>
 </body>

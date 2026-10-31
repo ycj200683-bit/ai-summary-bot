@@ -399,3 +399,112 @@ def test_stream_入参校验和同步接口一致(client):
 
     r = client.post("/api/summarize/stream", json={"text": "正常正文。", "length": 9})
     assert r.status_code == 422
+
+
+# ============================================================
+# 8) Agent 轨迹落库
+# ============================================================
+def _fake_agent_result(answer="已处理", tool="count_words", ok=True):
+    return {
+        "answer": answer,
+        "trace": [{
+            "step": 1, "tool": tool, "args": {"text": "abc"},
+            "ok": ok, "elapsed_ms": 3, "result": "3", "error": None,
+        }],
+        "steps": 1,
+        "elapsed_ms": 10,
+        "hit_max_steps": False,
+    }
+
+
+@pytest.fixture
+def agent_env(tmp_path, monkeypatch):
+    """
+    把轨迹库指到临时文件，并伪造一次运行结果——不联网、不花钱、结果稳定。
+
+    ★ 为什么连 run_agent 一起换：/api/agent 内部会真的走多步循环调模型。
+      这里要测的是"落库与查询"，不是"模型聪不聪明"，所以把外部世界整个挡掉。
+
+    ★ 为什么要在 import agent 前后比对 os.environ：agent.py 在模块顶层调
+      load_dotenv()，会把 .env 里的真配置（DISABLE_THINKING=1 等）塞进 os.environ。
+      这个 import 发生在测试中途，test_app 顶层那次"快照 + 还原"已经跑过了，
+      兜不住它——后果是后面的 test_main 用例读到被污染的环境，
+      "关思考默认关"那条会莫名其妙地失败（实测就是这么挂的）。
+      所以这里手动把本次新增的键删掉。
+    """
+    import types
+
+    env_before = set(os.environ)
+
+    import agent as agent_module
+    import agent_store
+
+    monkeypatch.setattr(agent_module, "run_agent",
+                        lambda query, runner, max_steps=6: _fake_agent_result())
+    # /api/agent 会读 client.config 造 ToolCallingClient，所以替身得带 config
+    monkeypatch.setattr(app_module, "get_client",
+                        lambda: types.SimpleNamespace(config=object()))
+    monkeypatch.setattr(app_module, "_model_name", "test-model", raising=False)
+
+    db = tmp_path / "agent_test.sqlite3"
+    monkeypatch.setattr(app_module, "connect_agent", lambda: agent_store.connect(db))
+    try:
+        yield db
+    finally:
+        for key in set(os.environ) - env_before:
+            os.environ.pop(key, None)
+
+
+def test_agent_run_is_persisted_and_queryable(client, agent_env):
+    r = client.post("/api/agent", json={"query": "数一下字数", "max_steps": 4})
+    assert r.status_code == 200
+    run_id = r.json()["run_id"]
+    assert run_id > 0, "跑完却没拿到 run_id"
+
+    runs = client.get("/api/agent/runs").json()
+    assert runs["count"] == 1
+    assert runs["runs"][0]["id"] == run_id
+    assert runs["runs"][0]["n_steps"] == 1
+
+    detail = client.get(f"/api/agent/runs/{run_id}").json()["run"]
+    assert detail["query"] == "数一下字数"
+    assert detail["trace"][0]["tool"] == "count_words"
+    # 存进去是 JSON 字符串，取出来必须还原成对象，否则前端还要二次解析
+    assert detail["trace"][0]["args"] == {"text": "abc"}
+
+
+def test_agent_run_detail_404_for_missing_id(client, agent_env):
+    r = client.get("/api/agent/runs/999999")
+    assert r.status_code == 404
+    assert "999999" in r.json()["detail"]
+
+
+def test_agent_stats_aggregates_by_tool(client, agent_env):
+    client.post("/api/agent", json={"query": "第一次", "max_steps": 4})
+    client.post("/api/agent", json={"query": "第二次", "max_steps": 4})
+
+    stats = client.get("/api/agent/stats").json()["tools"]
+    assert stats and stats[0]["tool"] == "count_words"
+    assert stats[0]["calls"] == 2
+    assert stats[0]["fails"] == 0
+
+
+def test_agent_run_survives_store_failure(client, agent_env, monkeypatch):
+    """
+    落库失败不能让用户看到 500。
+
+    ★ 这是本次改动的核心约束：Agent 已经跑完、答案已经在手上，
+      这时候数据库出问题只是"少一份存档"。主流程可用性优先于附加功能完整性。
+    """
+    import agent_store
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("disk I/O error")
+
+    monkeypatch.setattr(agent_store, "save_run", boom)
+
+    r = client.post("/api/agent", json={"query": "落库会失败", "max_steps": 4})
+    assert r.status_code == 200, "落库失败不该影响主流程"
+    body = r.json()
+    assert body["run_id"] == -1, "未落库时要用 -1 明确告诉调用方"
+    assert body["answer"] == "已处理"

@@ -37,6 +37,7 @@ app.py —— 把 ai_summary_bot 变成一个 Web 服务（FastAPI）
 
 import ipaddress
 import json
+import logging
 import os
 import threading
 import time
@@ -132,6 +133,9 @@ class AgentOut(BaseModel):
     model: str
     remaining: int = -1
     hit_max_steps: bool = False
+    # 落库后的记录 id。前端拿到它就能跳到"历史"里看这一条；
+    # 落库失败时为 -1（答案照常返回，不因为它牺牲主流程）
+    run_id: int = -1
 
 
 # ============================================================
@@ -172,6 +176,13 @@ def connect_kb():
       单元测试里可以用 monkeypatch 换掉它，不用起真实数据库。
     """
     from kb import connect
+
+    return connect()
+
+
+def connect_agent():
+    """打开 Agent 轨迹库的连接（和知识库分开的另一个 sqlite 文件）。"""
+    from agent_store import connect
 
     return connect()
 
@@ -543,15 +554,93 @@ def agent_run(payload: AgentIn, request: Request) -> AgentOut:
     except FatalError as e:
         raise HTTPException(status_code=502, detail=f"模型调用失败：{e}")
 
+    answer = result["answer"].strip()
+
+    # 落库：把这次运行的完整轨迹存下来，刷新页面后还能查。
+    # ★ 必须包 try/except：Agent 已经跑完、答案已经在手上，
+    #   这时候落库失败只是"少一份存档"，不能让用户看到一个 500。
+    #   主流程的可用性优先于附加功能的完整性——这是个通用的取舍原则。
+    run_id = -1
+    try:
+        from agent_store import save_run
+
+        conn = connect_agent()
+        try:
+            run_id = save_run(
+                conn, query, answer, result["trace"], result["elapsed_ms"],
+                model=_model_name, hit_max_steps=bool(result.get("hit_max_steps")),
+            )
+        finally:
+            conn.close()
+    except Exception as e:                      # noqa: BLE001
+        logging.getLogger("app").warning("trace 落库失败（不影响本次响应）：%s", e)
+
     return AgentOut(
-        answer=result["answer"].strip(),
+        answer=answer,
         trace=[AgentStep(**s) for s in result["trace"]],
         steps=result["steps"],
         elapsed_ms=result["elapsed_ms"],
         model=_model_name,
         remaining=remaining,
         hit_max_steps=bool(result.get("hit_max_steps")),
+        run_id=run_id,
     )
+
+
+@app.get("/api/agent/runs")
+def agent_runs(limit: int = 20) -> dict:
+    """
+    最近若干次 Agent 运行的摘要列表（不含每一步）。
+
+    ★ 为什么这个接口不返回 trace：列表页只要"哪次、几步、多久"。
+      把每条的 steps 一起带出来，接口耗时会随数据量线性增长，
+      而列表真正需要的只有一个摘要。
+    """
+    limit = max(1, min(limit, 100))
+
+    from agent_store import list_runs
+
+    conn = connect_agent()
+    try:
+        runs = list_runs(conn, limit=limit)
+    finally:
+        conn.close()
+    return {"ok": True, "count": len(runs), "runs": runs}
+
+
+@app.get("/api/agent/runs/{run_id}")
+def agent_run_detail(run_id: int) -> dict:
+    """取某一次运行的完整记录（含每一步的工具名、参数、返回值、耗时）。"""
+    from agent_store import get_run
+
+    conn = connect_agent()
+    try:
+        run = get_run(conn, run_id)
+    finally:
+        conn.close()
+
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"没有 id={run_id} 的运行记录")
+    return {"ok": True, "run": run}
+
+
+@app.get("/api/agent/stats")
+def agent_stats() -> dict:
+    """
+    按工具聚合的调用統計：次数、失败次数、平均耗时。
+
+    ★ 这个接口才是"落库"的价值所在。
+      没有它，简历上只能写"我记录了 trace"；
+      有了它，可以写"我能看出每个工具的失败率和耗时分布"。
+    """
+    from agent_store import tool_stats
+
+    conn = connect_agent()
+    try:
+        stats = tool_stats(conn)
+    finally:
+        conn.close()
+    return {"ok": True, "tools": stats}
 
 
 # ============================================================

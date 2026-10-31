@@ -20,7 +20,7 @@
 | 调用日志落盘 | 每次运行的关键信息和错误写入 `logs/app.log`，跑批量任务出问题可事后排查 |
 | **多厂商可切换** | 换服务商只改 `API_BASE_URL` / `MODEL_NAME` 两个环境变量，**代码一行不动** |
 | **Agent 工具调用** | 模型自主决定调哪个工具、调几次；步数上限防死循环，工具失败可降级，全程 trace 可查 |
-| **trace 可视化** | 每步记录工具名 / 参数 / 返回值 / 耗时 / 成败，在 `/agent` 页面渲染成时间线 |
+| **trace 可视化 + 落库** | 每步记录工具名 / 参数 / 返回值 / 耗时 / 成败，在 `/agent` 渲染成时间线；每次运行存进 sqlite，刷新后可回看，并能按工具聚合失败率与平均耗时 |
 | **知识库向量检索** | 文档切片 → 1024 维向量 → 存 sqlite → 余弦相似度检索，在 `/kb` 页面入库和试检索，并作为工具供 Agent 调用 |
 | **流式输出（SSE）** | `POST /api/summarize/stream` 边生成边推，首字 842ms（整段 948ms）；只重试"建连"、重试上限比同步更保守 |
 | **容器化部署** | Dockerfile 非 root 运行 + compose 命名卷挂知识库；实测 `compose down/up` 后文档与向量仍在 |
@@ -268,7 +268,10 @@ python -m uvicorn app:app --reload --port 8000
 | `POST` | `/api/summarize` | 单条摘要（同步，整段返回） |
 | `POST` | `/api/summarize/stream` | 单条摘要（**SSE 流式**，边生成边推） |
 | `POST` | `/api/quota/take` | 取一次额度（云服务链路调用前先来这里记账） |
-| `POST` | `/api/agent` | Agent 执行：模型自己决定调哪些工具，返回 answer + trace |
+| `POST` | `/api/agent` | Agent 执行：模型自己决定调哪些工具，返回 answer + trace + run_id |
+| `GET` | `/api/agent/runs` | 最近运行的摘要列表（不含每步，避免随数据量变慢） |
+| `GET` | `/api/agent/runs/{id}` | 某次运行的完整轨迹 |
+| `GET` | `/api/agent/stats` | 按工具聚合：调用次数 / 失败次数 / 平均耗时 |
 | `POST` | `/api/kb/upload` | 文档入库（切片 + 向量化，先查重再扣额度） |
 | `GET` | `/api/kb/docs` | 列出知识库文档 |
 | `DELETE` | `/api/kb/docs/{id}` | 删除文档（chunks 级联清理） |
@@ -489,6 +492,25 @@ run_agent(query):
 ```
 
 **这是 Agent 项目最该给人看的东西**——用户看到结果的同时，也知道它为什么得到这个结果。
+
+### 落库：从"能看"到"能查"
+
+trace 一开始只返回给前端，刷新就没了。现在每次运行都存进 sqlite（`agent_store.py`），模块 `/agent` 页面底部多了「历史记录」，点一条就能回看那次的执行轨迹。
+
+三个查询接口：`GET /api/agent/runs`（摘要列表）、`GET /api/agent/runs/{id}`（完整轨迹）、`GET /api/agent/stats`（按工具聚合）。
+
+**四个设计决定**
+
+| 决定 | 原因 |
+|---|---|
+| **`runs` + `steps` 两张表，不把 steps 塞成一列 JSON** | 真正想回答的问题是"哪个工具最常失败""平均耗时多少"。塞成 JSON，每个这类问题都要读全表在 Python 里算；拆成两张表，一句 `GROUP BY tool` 就出来了。**表的形状跟着问题走** |
+| **单独一个 `agent.sqlite3`，不混进 `kb.sqlite3`** | 读写模式不同：trace 是"每次请求写一批、频率高"，知识库是"偶尔批量写、大量读"。同库时 trace 的写锁会跟检索抢 |
+| **保留上限（默认 500 次运行），每次写入顺手淘汰** | trace 会无限长，几周就能吃满磁盘。用自增主键排序淘汰更早的，不需要额外的清理定时器 |
+| **落库失败绝不影响响应** | Agent 已经跑完、答案已经在手上，这时候数据库出问题只是"少一份存档"。让用户看到 500 是荒谬的。所以 `save_run` 外层包 `try/except`，失败时 `run_id` 返回 `-1` 明确告诉调用方"这次没存下" |
+
+**为什么列表接口不返回 trace**：列表只要"哪次、几步、多久"。把每条的 steps 一起带出来，接口耗时会随数据量线性增长——列表页不需要为它付这个代价。
+
+`/api/agent/stats` 是这个功能的价值所在：没有它，简历上只能写"我记录了 trace"；有了它，能写"我知道每个工具的失败率和耗时分布"。
 
 ---
 
@@ -814,7 +836,7 @@ python -m pytest -q        # 想看每条用例的名字，加 -v
 tests\test_app.py ..........................                             [ 41%]
 tests\test_main.py ....................................                  [100%]
 
-============================= 62 passed in 1.76s ==============================
+============================= 66 passed in 2.31s ==============================
 ```
 
 - `tests/test_main.py`：摘要内核 + 流式客户端。重试策略、SSE 解析（心跳/坏包/`[DONE]`）、流式只重试建连、句数收窄、排版规整、配置解析。
@@ -834,9 +856,9 @@ tests\test_main.py ....................................                  [100%]
 
 ### 持续集成
 
-每次推 `main` 或提 PR，GitHub Actions 自动跑一遍这 62 条测试（`.github/workflows/test.yml`，实测 18 秒）。
+每次推 `main` 或提 PR，GitHub Actions 自动跑一遍这 66 条测试（`.github/workflows/test.yml`，实测 18 秒）。
 
-CI 里**不注入 `API_KEY`、也不建 `.env`**——故意的：CI 不该有真密钥，而且测试本身用 `monkeypatch` 换掉了 `requests.post` 和 `get_client`，不依赖任何真实配置。这条约束反过来验证了一件事：**测试没有偷偷依赖本地 `.env`**。本地已实测过：临时移走 `.env` 后仍是 62 passed。
+CI 里**不注入 `API_KEY`、也不建 `.env`**——故意的：CI 不该有真密钥，而且测试本身用 `monkeypatch` 换掉了 `requests.post` 和 `get_client`，不依赖任何真实配置。这条约束反过来验证了一件事：**测试没有偷偷依赖本地 `.env`**。本地已实测过：临时移走 `.env` 后仍是 66 passed。
 
 CI 只做测试、不做构建和部署——仓库已有 Render Blueprint 和 Docker Compose 两套部署方式，再加一层只会多一个坏点。测试是唯一"每次都要跑、跑错代价最高"的环节。
 
@@ -849,6 +871,7 @@ ai-summary-bot/
 ├── main.py                  # 主程序：Config / LLMClient / Summarizer 三个类
 ├── agent.py                 # Agent：工具注册表 + 多步循环 + trace（复用 main 的客户端与摘要器）
 ├── kb.py                    # 知识库：切片 / 向量化 / sqlite 存储 / 余弦检索（也能单独 CLI 用）
+├── agent_store.py           # Agent 轨迹落库：runs + steps 两表、保留上限、按工具聚合
 ├── batch.py                 # 批量模式：读表 → 逐行摘要 → 断点续跑 → 写表
 ├── app.py                   # Web 服务：FastAPI 外壳 + 单页前端
 ├── share.py                 # 一键分享：绑 0.0.0.0 + 打印内网 IP（可选公网隧道）
@@ -864,7 +887,7 @@ ai-summary-bot/
 ├── docker-compose.yml       # 起服务 + 命名卷挂知识库（数据不随容器消失）
 ├── .dockerignore            # 排除 .env / .venv / corpus / 测试与文档
 ├── .github/workflows/
-│   └── test.yml             # CI：每次推送跑 62 条测试，不注入真密钥
+│   └── test.yml             # CI：每次推送跑 66 条测试，不注入真密钥
 ├── build_corpus.py          # 数据准备：corpus/*.txt → data.csv
 ├── fetch_corpus.py          # 语料采集：从公开接口补够 30 篇（带节流与清洗）
 ├── sample.txt               # 示例文本
@@ -876,7 +899,7 @@ ai-summary-bot/
 ├── conftest.py              # 把项目根加进 sys.path
 ├── tests/
 │   ├── test_main.py         # 36 个单元测试：摘要内核、SSE 解析、流式重试策略
-│   ├── test_app.py          # 26 个用例：限流、扣费时机、真实 IP 判定、知识库扣费、流式接口
+│   ├── test_app.py          # 30 个用例：限流、扣费时机、真实 IP 判定、知识库扣费、流式接口、轨迹落库
 │   └── README.md            # 测试写法讲解
 ├── corpus/                  # 语料 30 篇（有版权，已 gitignore）
 │   ├── 001~030.txt          # 标题 + 空行 + 正文
@@ -986,7 +1009,7 @@ return cls(api_key=key, api_url=normalize_api_url(base_url), model=model)
 - [ ] 统计条的平均耗时/今日次数只取最近 200 条样本，记录多了会有偏差；下一步改成服务端聚合
 - [ ] 只有一套 prompt；计划做两套方案对比评测并产出数据报告 → **v2.1**
 - [ ] Agent 的额度口径粗糙：一次请求内部可能 2-6 次模型调用，但只扣 1 次额度 → 按 token 或步数计费
-- [ ] Agent 的 trace 只返回给前端、不落库，刷新即丢 → 存 `steps` 表 + 历史查询接口
+- [x] ~~Agent 的 trace 只返回给前端、不落库，刷新即丢~~ → 已落库：`runs` + `steps` 两张表，配列表 / 详情 / 工具聚合三个接口
 - [ ] Agent 无工具结果缓存，同样的参数可能被重复调用 → 加一次会话内的结果缓存
 - [x] ~~`/agent` 没有首页入口，只能手敲地址~~ → 首页页头右上角已加「试试 Agent 模式」入口（360px 窄屏实测仍在一行内，不溢出）
 - [ ] 知识库每次检索都会全表扫描算点积。几千块没问题，上万块就该上索引（如 faiss / hnswlib）或加一层粗筛
@@ -1017,6 +1040,7 @@ return cls(api_key=key, api_url=normalize_api_url(base_url), model=model)
 | **v2.1** | **知识库向量检索**：切片 + 1024 维向量 + sqlite BLOB 存储 + 余弦检索，`/kb` 页面，并作为 `search_kb` 工具接进 Agent |
 | **v2.2** | **服务端流式**：`chat_stream()` + SSE 解析 + `/api/summarize/stream` + 前端逐字渲染；只重试建连、错误前置，流式不做句数重写 |
 | **v2.3** | **容器化**：Dockerfile（非 root + 依赖分层 + python 健康检查）+ compose 命名卷挂知识库；已在本机 build 并验证容器重建后数据不丢 |
+| **v2.4** | **Agent 轨迹落库**：`runs` + `steps` 两表 + 保留上限淘汰，三个查询接口（列表 / 详情 / 按工具聚合），`/agent` 页面加历史记录；落库失败不影响主流程 |
 
 > 提交粒度：一个功能一个分支（`feature/xxx`），完成后用 `--no-ff` 合并回 `main`，保留完整的合并记录。
 
