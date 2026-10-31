@@ -32,12 +32,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
 import sys
 import time
 from array import array
+from collections import Counter
 from operator import mul
 from pathlib import Path
 
@@ -56,7 +58,7 @@ EMBED_BATCH = 10          # 单次请求最多带几条文本（太大容易 400
 
 # 切片参数。chunk 太小 → 检索准但答案缺上下文；太大 → 上下文全但相似度被稀释。
 # 中文 400 字约等于 2-3 段，是"一段话能自洽"的常见尺度。
-CHUNK_SIZE = int(os.getenv("KB_CHUNK_SIZE", "400"))
+CHUNK_SIZE = int(os.getenv("KB_CHUNK_SIZE", "600"))
 CHUNK_OVERLAP = int(os.getenv("KB_CHUNK_OVERLAP", "80"))
 
 
@@ -325,12 +327,30 @@ def delete_document(conn: sqlite3.Connection, doc_id: int) -> bool:
 # 4) 检索
 # ============================================================
 def search(conn: sqlite3.Connection, query: str, top_k: int = 5,
-           config: Config | None = None) -> list[dict]:
+           config: Config | None = None, hybrid: bool = True) -> list[dict]:
     """
-    向量检索：把问题也向量化，和库里每块算余弦相似度，取前 top_k。
+    检索：默认走**混合检索**（向量 + 关键词，RRF 秩融合），hybrid=False 退化为纯向量。
 
-    返回 [{"score", "text", "doc", "doc_id", "ord"}]，按分数从高到低。
-    分数在 -1~1 之间；中文短问题对着长文档，0.3 以上通常已经相关了。
+    返回 [{"score", "lexical", "fused", "text", "doc", "doc_id", "ord"}]，按 fused 从高到低。
+    其中 `score` 仍然是余弦相似度（0~1 口径不变，前端的分档着色继续有效），
+    `fused` 才是排序依据——所以可能看到"第 1 名的余弦比第 2 名低"，那不是 bug，
+    正是关键词这一路把答案顶上来的结果。
+
+    ★ 为什么加混合检索（这是评测数据逼出来的，不是拍脑袋）：
+      20 题实测里，纯向量的 top1 只有 30%（400 字块）。失败最多的一类是
+      "只提到关键词但没给答案"的清单式段落——术语密度高、向量相似度高，
+      但里面根本没内容（典型：问"换 Redis 怎么保证原子性"，排在第一位的是
+      「已知限制」里那句"下一步换 Redis"，只比真答案高 0.007）。
+      纯向量对这种段落没有免疫力；关键词那一路则恰好相反——它对术语敏感，
+      但会被同义词/换述骗。两路互补，融合才有意义。
+
+    ★ 为什么用 RRF 而不是加权求和：
+      余弦是 0~1 的量，BM25 没有上界（几十到几百都可能），
+      加权求和必须先把两者归一化，而归一化方式本身就是个要调的参数
+      （min-max？除以最大值？对每批结果都一样吗？）。
+      RRF 只用**名次**：score = Σ 1/(k+rank)。名次天然可比，不用调权重，
+      是工业界融合多路检索的常用默认解。k 取 60 是老经验值：
+      它决定"名次差一点"和"名次差很多"的区分度。
     """
     query = (query or "").strip()
     if not query:
@@ -352,22 +372,108 @@ def search(conn: sqlite3.Connection, query: str, top_k: int = 5,
             "换过 embedding 模型的话需要先清空重建（python kb.py reset）。"
         )
 
-    scored: list[tuple[float, dict]] = []
-    for doc_id, ord_, text, blob, _dim, doc_name in rows:
+    q_tokens = set(_tokenize(query))
+    use_lexical = hybrid and bool(q_tokens)
+
+    # ---------- 一遍扫描，同时算余弦和 BM25 ----------
+    # 中文没有空格，只能靠 n-gram 兜底分词；先算 df（包含该词的块数）再算 IDF，
+    # IDF 的意义是"越少见的词越有区分度"，这正是纯向量缺的那部分信息。
+    items: list[dict] = []
+    df: Counter = Counter()
+    tokenized: list[list[str]] = []
+    for _doc_id, _ord, text, _blob, _dim, _name in rows:
+        toks = _tokenize(text)
+        tokenized.append(toks)
+        if use_lexical:
+            present = q_tokens & set(toks)
+            for t in present:
+                df[t] += 1
+
+    total = len(rows)
+    avgdl = (sum(len(t) for t in tokenized) / total) if total else 1.0
+
+    for idx, (doc_id, ord_, text, blob, _dim, doc_name) in enumerate(rows):
         vec = array("f")
         vec.frombytes(blob)
         # 两边都已归一化 → 点积就是余弦相似度，不必再除模长
-        score = sum(map(mul, qvec, vec))
-        scored.append((score, {
-            "score": round(score, 4),
+        cosine = sum(map(mul, qvec, vec))
+
+        lex = 0.0
+        if use_lexical:
+            toks = tokenized[idx]
+            dl = len(toks) or 1
+            tf_all = Counter(t for t in toks if t in q_tokens)
+            if tf_all:
+                # BM25：k1 控制词频饱和（同一个词出现 10 次不该比 5 次强一倍），
+                # b 控制长度归一化强度（长块不该因为字多就占便宜）
+                k1, b = 1.5, 0.75
+                for t, tf in tf_all.items():
+                    idf = math.log(1 + (total - df[t] + 0.5) / (df[t] + 0.5))
+                    lex += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgdl))
+
+        items.append({
+            "score": round(cosine, 4),
+            "lexical": round(lex, 4),
             "text": text,
             "doc": doc_name,
             "doc_id": doc_id,
             "ord": ord_,
-        }))
+            "_cos": cosine,
+            "_lex": lex,
+        })
 
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    return [item for _score, item in scored[:top_k]]
+    if not use_lexical:
+        items.sort(key=lambda x: x["_cos"], reverse=True)
+        for it in items:
+            it["fused"] = it["score"]
+        return [_strip_internal(it) for it in items[:top_k]]
+
+    # ---------- RRF 融合 ----------
+    K = 60
+    by_cos = sorted(range(len(items)), key=lambda i: items[i]["_cos"], reverse=True)
+    by_lex = sorted((i for i in range(len(items)) if items[i]["_lex"] > 0),
+                    key=lambda i: items[i]["_lex"], reverse=True)
+
+    fused: Counter = Counter()
+    for rank, i in enumerate(by_cos, 1):
+        fused[i] += 1.0 / (K + rank)
+    for rank, i in enumerate(by_lex, 1):
+        fused[i] += 1.0 / (K + rank)
+
+    for i, it in enumerate(items):
+        it["fused"] = round(fused.get(i, 0.0), 6)
+
+    # 只按关键词命中的块也要能进来，所以排序集合是 fused 的并集。
+    # ★ 打平时（fused 相同）以关键词分为准：字面精确命中比余弦相似度更可信。
+    #   这不是理论洁癖——只有两条候选时 RRF 会出现对称（一条余弦第一、关键词第二，
+    #   另一条正好相反，两者 fused 完全相等），没有裁决规则结果就是随机顺序。
+    items.sort(key=lambda x: (x["fused"], x["_lex"], x["_cos"]), reverse=True)
+    return [_strip_internal(it) for it in items[:top_k]]
+
+
+def _tokenize(text: str) -> list[str]:
+    """
+    极简分词：中文按二字滑窗，英文/数字/下划线按词切。
+
+    ★ 为什么不引 jieba：这个项目的检索层刻意保持零额外依赖（连 numpy 都没引）。
+      二字滑窗的代价是会切出一些无意义片段，但对 BM25 影响有限——
+      IDF 会自动把高频无意义片段（"的是""怎么"）的权重压到接近 0。
+    ★ 为什么英文要连下划线：代码标识符是整体概念，
+      `max_steps` 拆成 max 和 steps 就丢掉了它作为一个符号的辨识度。
+    """
+    tokens: list[str] = []
+    for run in re.findall(r"[\u4e00-\u9fa5]+", text):
+        if len(run) == 1:
+            tokens.append(run)
+        else:
+            tokens.extend(run[i:i + 2] for i in range(len(run) - 1))
+    tokens.extend(w.lower() for w in re.findall(r"[A-Za-z0-9_]{2,}", text))
+    return tokens
+
+
+def _strip_internal(item: dict) -> dict:
+    """把内部用于排序的字段去掉，别让它们在接口响应里露出来。"""
+    return {k: v for k, v in item.items() if not k.startswith("_")}
 
 
 # ============================================================

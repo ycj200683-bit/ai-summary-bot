@@ -46,7 +46,11 @@ from main import Config, load_dotenv
 from kb import add_document, connect, search
 
 PROJECT = Path(__file__).resolve().parent
-CORPUS = PROJECT / "README.md"
+# ★ 语料是 README 的一份**冻结快照**，不是 README 本身。
+#   README 既是项目文档又是评测语料，改了文档语料就变了，
+#   上一轮的数字和文档里写的块数立刻对不上——评测就成了"每次都有理"。
+#   快照一次之后，README 随便改，基准始终可复现。
+CORPUS = PROJECT / "docs" / "eval-corpus.md"
 OUT = PROJECT / "docs" / "retrieval-eval.md"
 
 # 20 条问题 + 标准答案锚点。
@@ -106,7 +110,8 @@ def build_db(chunk_size: int, overlap: int, db_path: Path, text: str,
     return conn, info["n_chunks"], (statistics.mean(lengths) if lengths else 0), elapsed
 
 
-def evaluate(conn: sqlite3.Connection, config: Config, top_k: int = 3) -> dict:
+def evaluate(conn: sqlite3.Connection, config: Config, top_k: int = 3,
+             hybrid: bool = True) -> dict:
     """
     跑完 20 条问题，算 top1 / top3 / MRR 与平均检索耗时。
 
@@ -129,7 +134,7 @@ def evaluate(conn: sqlite3.Connection, config: Config, top_k: int = 3) -> dict:
 
     for question, anchor in QA:
         t0 = time.time()
-        results = search(conn, question, top_k=top_k, config=config)
+        results = search(conn, question, top_k=top_k, config=config, hybrid=hybrid)
         latencies.append(int((time.time() - t0) * 1000))
 
         rank = None
@@ -172,40 +177,40 @@ def evaluate(conn: sqlite3.Connection, config: Config, top_k: int = 3) -> dict:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="检索评测：不同切片参数下的召回对比")
+    ap = argparse.ArgumentParser(description="检索评测：不同切片参数 / 检索模式的召回对比")
     ap.add_argument("--sizes", nargs="+", type=int, default=[300, 400, 600])
     ap.add_argument("--overlap", type=int, default=80)
+    ap.add_argument("--modes", nargs="+", default=["vector", "hybrid"],
+                    choices=["vector", "hybrid"])
     args = ap.parse_args()
 
     load_dotenv(str(PROJECT / ".env"))
     config = Config.from_env()
     text = CORPUS.read_text(encoding="utf-8")
 
-    print(f"语料 {CORPUS.name}：{len(text)} 字 ｜ overlap 固定 {args.overlap} ｜ 问题 {len(QA)} 条\n")
+    print(f"语料 {CORPUS.name}：{len(text)} 字 ｜ overlap 固定 {args.overlap} ｜ "
+          f"问题 {len(QA)} 条 ｜ 模式 {args.modes}\n")
 
     rows = []
     for cs in args.sizes:
         db = PROJECT / "data" / "eval" / f"readme_{cs}.sqlite3"
-        print(f"== chunk_size={cs} ==")
         conn, n_chunks, avg_len, build_s = build_db(cs, args.overlap, db, text, config)
-        print(f"   建库：{n_chunks} 块，平均 {avg_len:.0f} 字/块，耗时 {build_s:.1f}s")
+        print(f"== chunk_size={cs} ｜ {n_chunks} 块 ｜ 平均 {avg_len:.0f} 字/块 ==")
 
-        res = evaluate(conn, config)
+        for mode in args.modes:
+            res = evaluate(conn, config, hybrid=(mode == "hybrid"))
+            print(f"   [{mode:6s}] top1 {res['top1']:.0%} ｜ top3 {res['top3']:.0%} ｜ "
+                  f"MRR {res['mrr']:.3f} ｜ 平均检索 {res['avg_ms']:.0f} ms")
+            for m in res["misses"]:
+                print(f"      ✗ {m['kind']}：{m['question'][:18]}… "
+                      f"正确块 {m['truth_ords']} → top1 块 {m['top1_ord']}")
+            rows.append((cs, n_chunks, avg_len, mode, res))
         conn.close()
-
-        print(f"   top1 {res['top1']:.0%} ｜ top3 {res['top3']:.0%} ｜ MRR {res['mrr']:.3f} "
-              f"｜ 平均检索 {res['avg_ms']:.0f} ms")
-        for m in res["misses"]:
-            print(f"   ✗ {m['kind']}：{m['question']} "
-                  f"（正确块 {m['truth_ords']}，实际 top1 块 {m['top1_ord']} "
-                  f"分数 {m['top1_score']:.4f}）")
         print()
-
-        rows.append((cs, n_chunks, avg_len, res))
 
     # 写 markdown
     lines = [
-        "# 检索评测：切片大小对比",
+        "# 检索评测：切片大小 × 检索模式",
         "",
         f"- 语料：`{CORPUS.name}`（{len(text)} 字）",
         f"- 问题数：{len(QA)} 条（每条有唯一锚点字符串，见 `eval_retrieval.py`）",
@@ -214,14 +219,30 @@ def main() -> int:
         "",
         "## 结果",
         "",
-        "| chunk_size | 块数 | 平均块长 | top1 | top3 | MRR | 平均检索耗时 |",
-        "|---|---|---|---|---|---|---|",
+        "| chunk_size | 检索模式 | 块数 | 平均块长 | top1 | top3 | MRR | 平均检索耗时 |",
+        "|---|---|---|---|---|---|---|---|",
     ]
-    for cs, n_chunks, avg_len, res in rows:
+    for cs, n_chunks, avg_len, mode, res in rows:
+        label = "hybrid（向量+关键词 RRF）" if mode == "hybrid" else "vector（纯向量）"
         lines.append(
-            f"| {cs} | {n_chunks} | {avg_len:.0f} 字 | {res['top1']:.0%} | "
+            f"| {cs} | {label} | {n_chunks} | {avg_len:.0f} 字 | {res['top1']:.0%} | "
             f"{res['top3']:.0%} | {res['mrr']:.3f} | {res['avg_ms']:.0f} ms |"
         )
+
+    # 同一份库上 vector → hybrid 的提升
+    lines += ["", "## 混合检索带来了什么", "",
+              "| chunk_size | top1 提升 | top3 提升 | MRR 提升 |", "|---|---|---|---|"]
+    by_key = {(cs, mode): res for cs, _n, _l, mode, res in rows}
+    for cs in args.sizes:
+        v, h = by_key.get((cs, "vector")), by_key.get((cs, "hybrid"))
+        if v and h:
+            lines.append(
+                f"| {cs} | {v['top1']:.0%} → {h['top1']:.0%}"
+                f"（{(h['top1'] - v['top1']) * 100:+.0f}pt） "
+                f"| {v['top3']:.0%} → {h['top3']:.0%}"
+                f"（{(h['top3'] - v['top3']) * 100:+.0f}pt） "
+                f"| {v['mrr']:.3f} → {h['mrr']:.3f} |"
+            )
 
     lines += [
         "",
@@ -229,14 +250,14 @@ def main() -> int:
         "",
         "未命中不都是「检索不行」。下面是每条失败的实际形态，用来决定下一步该改什么。",
         "",
-        "| chunk_size | 问题 | 正确块 | 实际 top1 块 | top1 分数 | 判定 |",
+        "| chunk_size | 模式 | 问题 | 正确块 | 实际 top1 块 | 判定 |",
         "|---|---|---|---|---|---|",
     ]
-    for cs, _n, _len, res in rows:
+    for cs, _n, _len, mode, res in rows:
         for m in res["misses"]:
             lines.append(
-                f"| {cs} | {m['question']} | {m['truth_ords']} | {m['top1_ord']} | "
-                f"{m['top1_score']:.4f} | {m['kind']} |"
+                f"| {cs} | {mode} | {m['question']} | {m['truth_ords']} | "
+                f"{m['top1_ord']} | {m['kind']} |"
             )
 
     lines += [

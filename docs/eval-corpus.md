@@ -1,0 +1,1095 @@
+# 大模型文本摘要器（ai-summary-bot）
+
+用 Python 调用大模型 API，把长文本压缩成指定句数的中文摘要。既是**命令行工具**（读文件、控制长度、失败自动重试、日志落盘、只改环境变量即可切换任意 OpenAI 兼容的大模型服务），也是**可对外的 Web 服务**（FastAPI + 单页前端 + 接口文档），另有**批量模式**（CSV 逐行摘要、逐行容错、断点续跑），以及一个**工具调用 Agent**（模型自己决定调哪个工具、调几次，全程 trace 可见）。
+
+> 这是一个**从零搭建**的练手项目（不是跟教程抄的），目的是把「大模型应用开发」需要的工程化环节完整走一遍：
+> 依赖管理 → 面向对象设计 → 异常分级 → 装饰器重试 → 单元测试 → 日志落盘 → 多厂商可插拔 → Web 服务化 → 限流与配额 → 部署上线 → **Agent 工具编排**。
+
+![界面：贴一段正文，返回指定句数的摘要，附耗时与模型名](docs/screenshots/02_result.png)
+
+---
+
+## 功能特性
+
+| 特性 | 说明 |
+|---|---|
+| 读取文件生成摘要 | 支持 `.txt` / `.md`，不再受 `input()` 只能读一行限制 |
+| 可调摘要长度 | `--length` 指定摘要句数 |
+| 失败自动重试 | API 超时 / 网络抖动 / 429 限流 / 5xx → 指数退避重试（1s → 2s → 4s） |
+| 错误分级 | 401 / 402 这类不可恢复错误**立即失败**，不做无谓等待 |
+| 调用日志落盘 | 每次运行的关键信息和错误写入 `logs/app.log`，跑批量任务出问题可事后排查 |
+| **多厂商可切换** | 换服务商只改 `API_BASE_URL` / `MODEL_NAME` 两个环境变量，**代码一行不动** |
+| **Agent 工具调用** | 模型自主决定调哪个工具、调几次；步数上限防死循环，工具失败可降级，全程 trace 可查 |
+| **trace 可视化 + 落库** | 每步记录工具名 / 参数 / 返回值 / 耗时 / 成败，在 `/agent` 渲染成时间线；每次运行存进 sqlite，刷新后可回看，并能按工具聚合失败率与平均耗时 |
+| **知识库混合检索** | 文档切片 → 1024 维向量 + BM25 关键词双路，RRF 秩融合；存 sqlite，`/kb` 页面可入库与试检索，并作为工具供 Agent 调用 |
+| **流式输出（SSE）** | `POST /api/summarize/stream` 边生成边推，首字 842ms（整段 948ms）；只重试"建连"、重试上限比同步更保守 |
+| **容器化部署** | Dockerfile 非 root 运行 + compose 命名卷挂知识库；实测 `compose down/up` 后文档与向量仍在 |
+| 失败可被脚本感知 | 成功退出码 `0`、失败 `1`，可以直接用在 shell 脚本 / CI 里判断 |
+
+---
+
+## 环境要求
+
+- **Python 3.10+**（本项目在 3.14.5 上开发）
+- 任意 **OpenAI 兼容**的大模型服务 API Key。代码默认指向 DeepSeek 官方（<https://platform.deepseek.com/> 注册后在「API keys」页面创建）；本仓库当前 `.env` 实际用的是**阿里云百炼**的兼容端点 + `deepseek-v4.1-flash`，换厂商见下方「切换到其他服务商」
+- 依赖库：`requests`；跑测试需要 `pytest`
+
+---
+
+## 安装
+
+```bash
+git clone https://github.com/ycj200683-bit/ai-summary-bot.git
+cd ai-summary-bot
+
+# 建虚拟环境（推荐，避免污染全局环境）
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+
+pip install -r requirements.txt          # 运行依赖
+pip install -r requirements-dev.txt      # 想跑测试再装这个
+```
+
+### 一键启动（Windows）
+
+环境建好之后，不用每次敲命令，双击根目录的脚本即可：
+
+| 双击 | 做了什么 | 地址 |
+|---|---|---|
+| `启动.bat` | 本地起服务 + 3 秒后自动开浏览器 | <http://127.0.0.1:8000> |
+| `固定域名.bat` | 起服务 + Cloudflare 隧道 | 自己的固定域名 |
+
+`启动.bat` 还支持在命令行里传参切换分享模式：
+
+```bat
+启动.bat lan      局域网（同一 WiFi 下可访问）
+启动.bat tunnel   临时公网链接（地址每次变）
+启动.bat named    固定域名（走 Cloudflare Tunnel，默认 8001 端口）
+```
+
+脚本内置三项检查：`.venv` 不存在时给出建环境命令、缺 `.env` 时告警、端口被占用时自动让到下一个。
+
+> **改 bat 时注意编码**：这两个文件是 **GBK** 存的。用 VS Code 等编辑器改动后别存成 UTF-8，否则 cmd 解析中文会错位，报出一堆 `'RT' 不是内部或外部命令` 之类的怪错。
+
+### 配置（写在 `.env` 里，或直接用环境变量）
+
+配置项**不写进代码**，所以 key 不会被提交到仓库。两种给法，任选一种：
+
+**① 推荐：写进项目根目录的 `.env`**（已在 `.gitignore` 里，推不上仓库）
+
+```ini
+API_KEY=你的key
+API_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+MODEL_NAME=deepseek-v4.1-flash
+DISABLE_THINKING=1
+```
+
+`python main.py`、`python -m uvicorn app:app` 都会自己读它，不用每次开终端都 export 一遍。
+
+**② 或者直接用环境变量**（优先级更高，相同名字时以环境变量为准）
+
+```powershell
+# Windows（PowerShell）
+$env:API_KEY = "你的key"
+
+# Windows（Git Bash）/ macOS / Linux
+export API_KEY="你的key"
+```
+
+| 环境变量 | 是否必填 | 默认值 | 说明 |
+|---|---|---|---|
+| `API_KEY` | **必填** | 无 | 服务商的 API Key。未设置时程序直接退出并提示（不会带着空 key 去白白请求一次） |
+| `API_BASE_URL` | 可选 | `https://api.deepseek.com/v1` | 服务地址。**写 base 或写完整 URL 都行**，代码会自动补 `/chat/completions`，结尾多打的斜杠和空格也会处理掉 |
+| `MODEL_NAME` | 可选 | `deepseek-chat` | 模型名。本项目当前用 `deepseek-v4.1-flash`（走百炼）；也可填 `deepseek-chat` / `qwen-plus` / `gpt-4o-mini` / `qwen2.5:7b` 等 |
+| `DISABLE_THINKING` | 可选 | 关 | 设成 `1` 关闭"深度思考"。摘要不需要推理，开着只是白等——同一篇 2320 字文章要 5 句：开思考 15.9 s，关思考 2.2 s。只对支持该参数的模型有效 |
+
+> 兼容旧配置：只设 `DEEPSEEK_API_KEY`（不含 `API_KEY`）也仍然能跑，不会因为升级就报错。
+>
+> `.env` 里能写的东西只有三样，别塞注释以外的花活：一行一个 `KEY=VALUE`，`#` 开头的行会被跳过，值两端的引号会自动剥掉。
+
+### 切换到其他服务商
+
+只要对方提供 OpenAI 兼容接口，改两个环境变量就能切，**代码一行不用动**：
+
+```powershell
+# 例：阿里云百炼
+$env:API_KEY      = "sk-百炼的key"
+$env:API_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+$env:MODEL_NAME   = "qwen-plus"
+
+# 例：本地 Ollama（不用 key，随便填一个非空值即可）
+$env:API_KEY      = "ollama"
+$env:API_BASE_URL = "http://localhost:11434/v1"
+$env:MODEL_NAME   = "qwen2.5:7b"
+
+# 例：OpenAI 官方
+$env:API_KEY      = "sk-..."
+$env:API_BASE_URL = "https://api.openai.com/v1"
+$env:MODEL_NAME   = "gpt-4o-mini"
+```
+
+改完直接跑，日志第一行会告诉你当前实际连到哪去了：
+
+```
+14:52:14 | INFO    | 🤖 模型：qwen-plus ｜ 端点：https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+```
+
+---
+
+## 用法
+
+```bash
+python main.py --file sample.txt
+```
+
+### 参数表
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `--file` | 路径 | 无 | 要摘要的文本文件。**不传则进入交互模式**，手动粘贴文本 |
+| `--length` | 整数 | `3` | 摘要句数，会写进系统提示词；句数不符会自动重写一次 |
+| `-h` / `--help` | — | — | 查看帮助 |
+
+### 示例 1：摘要一个文件
+
+```bash
+python main.py --file sample.txt
+```
+
+```
+14:52:14 | INFO    | 📄 已读取文件：sample.txt（359 字）
+14:52:14 | INFO    | 🤖 模型：qwen-plus ｜ 端点：https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+
+--- 摘要结果 ---
+
+人工智能正深刻改变软件开发与产品设计流程：开发者可用自然语言生成代码初稿，
+产品经理可快速产出调研问卷、分析反馈和竞品框架，大幅提升效率。
+但 AI 生成内容存在缺陷风险与业务理解局限，需更严格的人工评审；
+其本质是辅助工具，无法替代人的专业判断与业务洞察。
+核心价值不在于替代人力，而在于将人从重复劳动中解放，聚焦于更高阶的决策
+——"做什么"和"为什么做"。
+```
+
+> 前两行是 `logging` 输出（自动带时间戳，同时落盘到 `logs/app.log`），
+> 后面是 `print` 输出。**判据**：给开发者看的记录走 logging，给用户看的结果走 print。
+>
+> 上面这次运行恰好是用**百炼 qwen-plus** 跑的——同一份代码，只换了环境变量。
+
+### 示例 2：自定义摘要句数
+
+```bash
+python main.py --file sample.txt --length 5
+```
+
+`--length 5` 会把系统提示词里的约束改成「写正好 5 句话」，并要求一共 5 个句号。
+
+> 早期版本写的是「5 句话以内」——那是上限而不是目标，模型给 4 句也算完成任务，
+> 于是用户点「5 句」却拿到 4 句。现在改成目标句数，并在拿到结果后数一遍标点：
+> 不符就带着「你刚才写了 N 句」的纠正要求重写一次（只重试一次，避免成本翻倍）。
+>
+> **但"正好 N 句"不能无脑执行**：原文只有 69 个字却要 5 句，模型会把一句话劈成两句，
+> 出现「……气候干燥。冬季寒冷。」这种残句。所以句数按正文字数封顶：
+>
+> | 正文字数 | 最多几句 |
+> |---|---|
+> | < 200 | 2 |
+> | 200 ~ 599 | 3 |
+> | 600 ~ 1499 | 4 |
+> | ≥ 1500 | 5 |
+>
+> 收窄发生时，命令行会打一行 `📏 正文 69 字，5 句会拆碎，按 2 句生成`，
+> 网页会在结果标题后面注明「原文 69 字，按 2 句给出」，接口通过 `sentences_used` 返回实际句数。
+
+### 示例 3：API 出错时
+
+程序**不会崩**，会打印明确的原因，并把错误记进日志。
+
+不可恢复错误（key 无效 / 余额不足）——立即失败，不重试：
+
+```
+14:22:05 | INFO    | 📄 已读取文件：sample.txt（359 字）
+14:22:05 | INFO    | 🤖 模型：deepseek-chat ｜ 端点：https://api.deepseek.com/v1/chat/completions
+14:22:06 | ERROR   | ❌ 401/403 key 不对或没权限，别重试，去检查 key
+```
+
+可恢复错误（429 限流 / 超时 / 5xx）——自动重试，过程也记进日志：
+
+```
+14:23:09 | INFO    | 🤖 模型：deepseek-chat ｜ 端点：https://api.deepseek.com/v1/chat/completions
+14:23:10 | WARNING | 🔁 第 1 次失败（429 被限流了，等一会儿可以重试），1 秒后重试……
+14:23:13 | WARNING | 🔁 第 2 次失败（429 被限流了，等一会儿可以重试），2 秒后重试……
+```
+
+换厂商时最容易踩的坑：**只改了端点，忘了改模型名**（这是真实跑出来的输出）：
+
+```
+14:54:26 | INFO    | 🤖 模型：deepseek-chat ｜ 端点：https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+14:54:26 | ERROR   | ❌ 404 找不到接口或模型。若刚换过厂商，请检查 API_BASE_URL 和 MODEL_NAME 是否配套改了。
+                     服务端原文：{"error":{"message":"The model `deepseek-chat` does not exist...","code":"model_not_found"}}
+```
+
+> 看出来了吗——报错上方那行日志已经把「当前模型是 `deepseek-chat`、端点却是百炼」摊在眼前了，配置错位一眼可见。这也是为什么要专门打那行启动日志。
+
+连 key 都没设时——连请求都不会发出去：
+
+```
+❌ 没找到环境变量 API_KEY（旧名 DEEPSEEK_API_KEY 也认）。请先设置：
+   PowerShell: $env:API_KEY="你的key"
+   Git Bash  : export API_KEY="你的key"
+   可选：$env:API_BASE_URL / $env:MODEL_NAME 换厂商
+```
+
+**退出码**：成功 `0`，失败 `1`（包括没设 key 的情况）。所以在脚本或 CI 里可以直接用退出码判断，不必去 grep 输出文本。
+
+---
+
+## Web 服务（FastAPI）
+
+命令行之外，同一套摘要能力也通过 HTTP 暴露出来了，别人不用装 Python 就能用。
+
+```bash
+python -m uvicorn app:app --reload --port 8000
+```
+
+打开 <http://127.0.0.1:8000> 是网页界面，<http://127.0.0.1:8000/docs> 是自动生成的 API 文档（Swagger UI，可以直接在页面上试接口）。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/` | 摘要页（`web/index.html`，前后端物理分开） |
+| `GET` | `/agent` | Agent 演练场（指令 + trace 时间线） |
+| `GET` | `/kb` | 知识库（上传 / 列表 / 检索测试） |
+| `GET` | `/docs` | FastAPI 自动生成的接口文档 |
+| `GET` | `/api/health` | 健康检查：模型名、是否已配置、限额、计数口径 |
+| `POST` | `/api/summarize` | 单条摘要（同步，整段返回） |
+| `POST` | `/api/summarize/stream` | 单条摘要（**SSE 流式**，边生成边推） |
+| `POST` | `/api/quota/take` | 取一次额度（云服务链路调用前先来这里记账） |
+| `POST` | `/api/agent` | Agent 执行：模型自己决定调哪些工具，返回 answer + trace + run_id |
+| `GET` | `/api/agent/runs` | 最近运行的摘要列表（不含每步，避免随数据量变慢） |
+| `GET` | `/api/agent/runs/{id}` | 某次运行的完整轨迹 |
+| `GET` | `/api/agent/stats` | 按工具聚合：调用次数 / 失败次数 / 平均耗时 |
+| `POST` | `/api/kb/upload` | 文档入库（切片 + 向量化，先查重再扣额度） |
+| `GET` | `/api/kb/docs` | 列出知识库文档 |
+| `DELETE` | `/api/kb/docs/{id}` | 删除文档（chunks 级联清理） |
+| `POST` | `/api/kb/search` | 纯向量检索，不经过模型生成 |
+
+请求示例：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/summarize \
+  -H "Content-Type: application/json" \
+  -d '{"text": "要摘要的正文……", "length": 3}'
+```
+
+```json
+{
+  "summary": "……",
+  "latency_ms": 1988,
+  "input_chars": 127,
+  "model": "deepseek-v4.1-flash",
+  "sentences_used": 3,
+  "remaining": 19
+}
+```
+
+`sentences_used` 是实际用了几句（正文太短会被收窄）；`remaining` 是这个 IP 今天还剩几次，页面右上角就显示它。
+
+流式接口的响应体是 SSE，一事件一行（详细格式见下面的「流式输出」一节）：
+
+```
+data: {"delta":"青海湖是中国最大的"}
+data: {"delta":"内陆咸水湖……"}
+data: {"done":true,"summary":"青海湖是中国最大的内陆咸水湖……","first_token_ms":842,"latency_ms":1187,"sentences_used":2,"sentences_got":2,"remaining":18}
+```
+
+### 两条生成链路（页面上可切换）
+
+| 链路 | 走哪里 | 花谁的额度 | 特点 |
+|---|---|---|---|
+| **我的 Key**（默认） | 浏览器 → `POST /api/summarize` → 自己的模型 key | 自己的 | 成本可控、额度自己说了算；不依赖任何外部脚本，最快 |
+| 云服务 | 浏览器 → 云服务 SDK → 平台大模型（流式） | 平台的 | 边收边渲染；但要多加载一个 CDN 脚本，网络不好时可能加载失败 |
+
+> CDN 引的是**写死的版本号**（`@0.1.4`），不是 `@dev` / `@latest`。浮动标签会跟着上游发布自动变，某天一个 breaking change 推上来页面就白屏，而你本地什么都没改、查半天查不出来。升级时手动改数字，改完自己点一遍。
+
+设计要点：
+
+- **两条链路都写同一张云端表 `summary_stats`**（只存字数、耗时、模型名，不存正文，也不存摘要内容）。
+- **额度不能重复扣**：`/api/summarize` 服务端内部已经记过一次账，前端走这条路时**不再**调 `/api/quota/take`；只有云服务链路才需要前端先取额度。
+- **云服务不可用时自动回退**：jsDelivr 在国内不稳，SDK 拿不到时点「云服务」不会卡死，而是自动改用「我的 Key」并在页面顶部说明一句——自有 Key 这条路不依赖任何外部脚本，永远能走。
+
+### 这一层的三个设计决定
+
+| 决定 | 原因 |
+|---|---|
+| **不用 `Config.from_env()` 直接初始化** | 它在没配 key 时会 `raise SystemExit`。命令行里这是"程序退出"，在服务里会把整个进程带崩。改成惰性创建 + 返回 503，服务能启动、能说清原因 |
+| **每个 IP 每天 20 次 + 全站每天 300 次** | 公开部署后，背后是真金白银的 API 账单。不限流的话，一个脚本就能把额度刷光。单 IP 限额能换 IP 绕过，所以再加一道全站闸门 |
+| **Pydantic 做入参校验** | `text` 限 1~5000 字、`length` 限 1~5，超了自动返回 422，不用自己写 if |
+
+关于限流的三条坑（都已处理，写在代码注释里）：
+
+| 坑 | 处理 |
+|---|---|
+| **先扣费再校验** | 纯空白正文（`" "`）能通过 `min_length=1`，以前会被扣一次额度再返回 400。现在先 `strip()` 校验、再扣费 |
+| **`X-Forwarded-For` 可伪造** | 以前取第一段，换 25 个假 IP 能绕过 20 次限额。现在：直连来源是公网 IP 就完全不信 XFF；是内网/回环（说明前面有反代）才取**最后一段**——最后一段是最近一跳代理追加的，客户端改不了 |
+| **计数存在进程内存** | 重启清零；`--workers N` 时每进程各记一份，全站上限变成 N 倍。要多进程就先换 Redis |
+| **账本只增不减 + 并发穿透** | `_usage` 每天清一次过期 IP，否则 IP 越攒越多；`check_quota()` 整段加锁，否则并发时"读-判断-写"不是原子的，20 个请求同时到可能全都放行 |
+
+> `/api/health` 会返回 `quota_scope: "process-memory"`，部署时一眼能看到当前实例的计数口径。
+
+### 「那你怎么换成 Redis？」——口述版
+
+`/api/health` 里明写了 `quota_scope: "process-memory"`，这就是主动把问题摊开。面试官看到这一行一定会问："多实例怎么办？"答不上来就是自己给自己挖坑，所以这里把话说完整。
+
+**现在的实现**：`_usage`（每 IP 当天计数）+ `_global`（全站计数）两个模块级结构，用 `threading.Lock` 包住"读—判断—写"。
+
+**换成 Redis 要动的其实只有三处**：
+
+```python
+# ① 扣额度：从"读内存"改成"原子自增"
+pipe = r.pipeline()
+pipe.incr(f"quota:ip:{ip}:{today}")
+pipe.expire(f"quota:ip:{ip}:{today}", 86400)
+pipe.incr(f"quota:global:{today}")
+pipe.expire(f"quota:global:{today}", 86400)
+ip_used, _, global_used, _ = pipe.execute()
+
+# ② 判断超限：INCR 返回的是"加完之后"的值，天然没有竞态
+if ip_used > MAX_CALLS_PER_DAY or global_used > MAX_CALLS_PER_DAY_GLOBAL:
+    r.decr(...)              # 超了要把刚才加的退回去
+    raise HTTPException(429, "今日额度用完")
+
+# ③ 清理过期 IP：不用再自己扫，靠 key 的 EXPIRE 到期自动消失
+```
+
+**关键点，也是真正会被追问的地方：**
+
+| 点 | 说明 |
+|---|---|
+| **INCR 是原子的** | 现在的 `Lock` 只能在单进程内挡并发，多 worker 时每个进程各持一把锁，等于没有。Redis 的 `INCR` 单命令原子，多实例安全 |
+| **"先加再判断"而不是"先判断再加"** | 先 GET 再 SET 存在竞态窗口。先 INCR 拿到加完的值再判断，超了回退，才不会出现"20 个并发全放行" |
+| **用 EXPIRE 代替自己扫表** | 现在 `_sweep_locked()` 每天清一次过期 IP，换成 Redis 后 key 自己会过期，这段逻辑整段删掉 |
+| **Redis 挂了怎么办** | 这是必须主动说的：要么 fail-open（放行，但要告警），要么 fail-closed（全站 503）。公开 Demo 选 fail-open，因为限流是为了省钱不是安全边界 |
+| **降级路径** | `QUOTA_BACKEND=memory\|redis` 一个环境变量切换，Redis 连不上自动回落到进程内存并打警告——本地开发和 CI 不用装 Redis |
+
+**为什么现在不换**：单实例部署下进程内存是**准确**的，Redis 只会多一个故障点和一个运维依赖。规模没到就先不加——这是取舍，不是不会。
+
+---
+
+## 流式输出（SSE）
+
+`POST /api/summarize/stream` —— 模型吐一段就推一段，页面边收边显示。
+
+首页的按钮行有个「流式」复选框，只对「我的 Key」这条链路生效（云服务那条本来就走平台 SDK 的流式）。
+
+### 省了多少：实测，不是感觉
+
+| | 首字 | 总耗时 |
+|---|---|---|
+| 流式 | **842 ms** | 1187 ms |
+| 同步（同一段文本） | — | 948 ms |
+
+被测文本 150 字、要求 3 句，收到 **15 个事件 / 14 个增量片段**。
+
+**该怎么解读这个数字**：流式省下的是"生成那部分"（约 345ms），省不掉上游的首 token 延迟（842ms，谁来都要等）。所以**输出越长，省得越多**；输出本来只有两句话，就别吹"快十倍"。30 篇语料压测的均值 2.39s 是长文本场景，不能拿来给这条背书。
+
+### 四个工程决定
+
+| 决定 | 原因 |
+|---|---|
+| **用 SSE，不用 WebSocket** | 这是服务端单向推文本，没有双向需求。SSE 就是一个不关闭的 HTTP 响应，浏览器原生支持，不用协议升级、不用自己维护心跳 |
+| **生成器不能直接套 `@retry`** | `@retry` 只能重试"函数调用"，而生成器函数体要到迭代时才执行。语义上更严重：已经吐了几段再重试，用户会先看到半句话、然后这句话从头再来一遍 |
+| **只重试"建连"，且上限 2 次** | 发请求 + 查状态码这一步可以重试；一旦开始收数据就如实抛出。上限比同步的 3 次更保守——流式的首字延迟直接就是用户在等的成本 |
+| **校验和扣额度必须在返回 `StreamingResponse` 之前** | 一旦开始推流，HTTP 状态码就发出去了（默认 200）。这时候才发现"额度不足"或"正文空白"，只能塞进事件体里，前端得解析两套错误 |
+
+### 两个容易漏的技术细节
+
+**① 响应头要带 `X-Accel-Buffering: no`**
+nginx 之类的反代会把响应缓冲起来攒够一批再发，于是前端等到最后一次性收到全部内容——"流式"名存实亡。
+
+**② 前端必须自己处理半包**
+`reader.read()` 拿到的块**不保证按事件边界切分**，可能半条 JSON 就来了。所以要缓冲，只在遇到 `\n\n` 时才认为一个事件完整：
+
+```js
+buf += decoder.decode(chunk, { stream: true });
+let cut;
+while ((cut = buf.indexOf("\n\n")) >= 0) { /* 切出完整事件 */ }
+```
+
+`decoder.decode(..., { stream: true })` 也有讲究：不传 `stream: true` 的话，中文的一个字被切在两个 chunks 之间就会解成乱码。
+
+**③ 流式不做"句数不符就重写一次"**
+同步链路会带着纠正要求重写一遍把句数补齐。流式**故意不这么做**：重写意味着已经显示在屏幕上的内容会被整段替换掉，体验比少一句糟糕得多。代价是句数可能不准——所以收尾事件里会带上 `sentences_used` / `sentences_got`，前端在句数不足时明确提示"需要严格句数请关掉流式"。
+
+---
+
+## Agent（让模型自己决定调什么工具）
+
+前面的摘要器是**固定路径**：输入 → 一次模型调用 → 输出。
+Agent 是**不固定路径**：输入 → 模型决定调哪个工具 → 执行 → 把结果喂回去 → 再决定 …… → 直到它不再要工具。
+
+页面：`http://127.0.0.1:8000/agent`　接口：`POST /api/agent`
+（首页页头右上角有「试试 Agent 模式」的入口，不用手敲地址）
+
+![Agent 执行轨迹：读文件 → 统计字数 → 摘要，三步由模型自己串起来](docs/screenshots/agent-trace.png)
+
+### 循环长什么样
+
+```
+run_agent(query):
+    messages = [system, user]
+    for step in range(max_steps):          # ① 步数硬闸，防死循环
+        msg = 模型(messages, tools)         # ② 带上工具说明书
+        if 没有 tool_calls: return 回答      # ③ 模型说"够了"
+        for call in tool_calls:
+            result = 执行工具(call)          # ④ 失败不炸，包装成 {ok:false}
+            messages.append(role="tool", tool_call_id=..., content=result)
+```
+
+就这四步。所谓"Agent 框架"，核心也是这个循环加了状态管理。
+
+### 四个工具
+
+| 工具 | 作用 | 为什么放它进来 |
+|---|---|---|
+| `read_file` | 读项目目录下的文本文件 | 让 Agent 能"自己拿材料"，而不是人把正文粘进去 |
+| `count_words` | 统计字数 | 最便宜的确定性工具，用来验证链路 |
+| `extract_keywords` | 提取关键词 | 展示"工具可以返回结构化数据" |
+| `summarize_text` | 复用 `Summarizer` 做摘要 | **工具可以复用已有业务代码**，不必重写一套 |
+
+### 五个工程决定
+
+| 决定 | 原因 |
+|---|---|
+| **步数上限默认 6、最高 10** | 没有它，模型可能在两个工具之间来回调到天荒地老，一次请求烧掉几十次 API 调用 |
+| **工具失败不中断循环** | 异常包装成 `{ok:false, error}` 回填给模型，让它自己决定换路径还是放弃。一失败就崩，等于把 Agent 降级成脚本 |
+| **`role=tool` 必须带 `tool_call_id`** | 不带的话模型对不上号，会反复调同一个工具 |
+| **单独一个 `ToolCallingClient`** | `LLMClient.chat()` 只返回纯文本，而工具调用需要完整的 `message` 对象（含 `tool_calls`）。这不是重复造轮子，是职责不同 |
+| **`read_file` 有路径护栏** | 挡住 `../../` 越界读取。工具能碰文件系统，就必须有边界 |
+
+### 踩过的三个坑
+
+| 坑 | 现象 | 处理 |
+|---|---|---|
+| **超时沿用 30s** | 第一次跑直接 `请求超时` | 带 tools 的请求比普通摘要慢一个量级（实测：无工具 0.6s、带工具 4.3s）。给 Agent 单独放 120s，并加 `--probe` 分别测两条链路 |
+| **关键词工具返回整句** | 模型看到结果后说"这个工具没切分出来" | 正则 `[\u4e00-\u9fa5]{2,}` 是贪婪匹配，整句被当成一个词。改成"≤4 字整体保留、长串二字滑窗" |
+| **`agent.py` 单独跑读不到 `.env`** | 报"没找到 API_KEY" | `main.py` 只在 `main()` 里调 `load_dotenv()`，脚本单独跑时不会触发。在 `agent.py` 顶部显式加载 |
+
+> 第一个坑是最值钱的一次调试：**先分清"网络慢"还是"模型不支持工具"，再动手改**。`--probe` 就是为这件事加的——两条链路各打一次，一眼看出差在哪。
+
+### trace：让黑盒变白盒
+
+每步都记 `工具名 / 参数 / 返回值预览 / 耗时 / 成败`，前端渲染成时间线。
+
+```
+① read_file         成功  1 ms     {"path":"sample.txt"}  → 返回 人工智能正在改变软件开发的方式…
+② count_words       成功  0 ms     {"text":"…"}           → 返回 359
+③ summarize_text    成功 1248 ms   {"text":"…"}           → 返回 本文讨论了…
+共 3 步 ｜ 6673 ms ｜ 今日剩余 18 次
+```
+
+**这是 Agent 项目最该给人看的东西**——用户看到结果的同时，也知道它为什么得到这个结果。
+
+### 落库：从"能看"到"能查"
+
+trace 一开始只返回给前端，刷新就没了。现在每次运行都存进 sqlite（`agent_store.py`），模块 `/agent` 页面底部多了「历史记录」，点一条就能回看那次的执行轨迹。
+
+三个查询接口：`GET /api/agent/runs`（摘要列表）、`GET /api/agent/runs/{id}`（完整轨迹）、`GET /api/agent/stats`（按工具聚合）。
+
+**四个设计决定**
+
+| 决定 | 原因 |
+|---|---|
+| **`runs` + `steps` 两张表，不把 steps 塞成一列 JSON** | 真正想回答的问题是"哪个工具最常失败""平均耗时多少"。塞成 JSON，每个这类问题都要读全表在 Python 里算；拆成两张表，一句 `GROUP BY tool` 就出来了。**表的形状跟着问题走** |
+| **单独一个 `agent.sqlite3`，不混进 `kb.sqlite3`** | 读写模式不同：trace 是"每次请求写一批、频率高"，知识库是"偶尔批量写、大量读"。同库时 trace 的写锁会跟检索抢 |
+| **保留上限（默认 500 次运行），每次写入顺手淘汰** | trace 会无限长，几周就能吃满磁盘。用自增主键排序淘汰更早的，不需要额外的清理定时器 |
+| **落库失败绝不影响响应** | Agent 已经跑完、答案已经在手上，这时候数据库出问题只是"少一份存档"。让用户看到 500 是荒谬的。所以 `save_run` 外层包 `try/except`，失败时 `run_id` 返回 `-1` 明确告诉调用方"这次没存下" |
+
+**为什么列表接口不返回 trace**：列表只要"哪次、几步、多久"。把每条的 steps 一起带出来，接口耗时会随数据量线性增长——列表页不需要为它付这个代价。
+
+`/api/agent/stats` 是这个功能的价值所在：没有它，简历上只能写"我记录了 trace"；有了它，能写"我知道每个工具的失败率和耗时分布"。
+
+---
+
+## 知识库（向量检索）
+
+Agent 的工具里最重的一个是 `search_kb` —— 它让"模型自己去查资料"成为可能。
+
+页面：`/kb`　接口：`POST /api/kb/upload`、`POST /api/kb/search`、`GET /api/kb/docs`
+
+![知识库页面：上传文档、已入库列表、检索测试](docs/screenshots/03_kb.png)
+
+### 一篇文档进库要经过什么
+
+```
+上传原文
+  → 切片：按空行切段，超长段按句末标点切碎，再贪心聚合到 600 字，块间重叠 80 字
+  → 向量化：text-embedding-v3，1024 维，每批 10 条，坏一批只重试那一批
+  → L2 归一化
+  → 存 sqlite：向量按 float32 存 BLOB
+
+检索：
+问题 → 向量化 → 与每块算点积（两边都是单位向量，点积即余弦相似度）→ 取 top_k
+```
+
+### 几个关键取舍
+
+| 决定 | 为什么 |
+|---|---|
+| **用 sqlite，不用向量数据库** | 规模是几百到几千块。sqlite 单文件、零服务、备份就是拷个文件；为几千行向量多起一个 Postgres 是净亏。真到需要时再换，`search()` 接口不用动 |
+| **向量存 BLOB，不存 JSON** | 1024 维 float32 = 4KB；写成 JSON 约 20KB，且每次读都要 `json.loads` 一遍（几千块就是几十万次浮点解析）。BLOB `frombytes` 后直接能算 |
+| **入库时就做 L2 归一化** | 余弦 = 点积 / 模长积。两边都归一化后分母恒为 1，检索时只剩点积，省掉"给全库向量算模长"这笔最大开销 |
+| **不引 numpy** | 几千次 1024 维点积，`sum(map(operator.mul, a, b))` 就够（微秒级，循环在 C 层）。为这点计算给部署加个二进制依赖不划算 |
+| **块间重叠 80 字** | 答案经常横跨两块边界。不重叠的话"上一块结尾 + 下一块开头"这句在哪块里都读不通，检不到 |
+| **切在句末标点** | 硬切会把一句话劈成两半，这半句在任何块里都不完整，命中了也没用 |
+| **先查重、再扣额度** | 重复上传不该吃额度。反过来的话前端还在提示"没有重复消耗额度"，等于对用户说假话——这个 bug 真的写出来过一次，被验证脚本抓到 |
+
+### 被问到"为什么用 sqlite"时怎么答
+
+面试里真正会被追问的不是"你用了什么"，而是"你知不知道自己选了什么"。这一节是为了让这个问题答得住。
+
+**表结构（两张表 + 一张元数据）**
+
+```sql
+documents(id, name, content_hash UNIQUE, n_chunks, created_at)
+chunks(id, doc_id → documents(id) ON DELETE CASCADE, ord, text, vec BLOB, dim)
+meta(key, value)          -- 存 embedding 模型名与维度
+```
+
+三个刻意的设计点：
+
+- `content_hash` 建唯一索引：同一篇内容重复上传时直接命中，不重复花 embedding 额度
+- `chunks.doc_id` 外键 + `ON DELETE CASCADE`：删文档自动清块，不靠应用层记得删
+- `meta` 存 `dim` 和模型名：换过 embedding 模型时明确报错，而不是拿两种维度的向量硬算
+
+**四个必须自己先承认的局限**
+
+| 局限 | 什么情况下会出问题 | 怎么解 |
+|---|---|---|
+| 没有向量索引，检索是全表扫描算点积 | 几千块没问题，上万块线性变慢 | faiss / hnswlib 建 ANN 索引，或先做一层粗筛 |
+| 不支持并发写 | 多进程/多 worker 同时写入会 `database is locked` | 单写者模式 + 队列，或换 Postgres |
+| 没有备份与迁移机制 | 文件损坏就是全丢 | 定期拷贝 + 版本化迁移脚本 |
+| 部署在容器里是临时的 | Render 上重新部署即清空 | 挂持久磁盘，或对象存储冷启动预热 |
+
+**60 秒口述版**
+
+> 这个知识库的规模是几百到几千个文本块，所以我用了 sqlite：单文件、零服务、备份就是拷一个文件，部署到免费层也不用额外起数据库。向量按 float32 存 BLOB 而不是 JSON，1024 维是 4KB 对比 20KB，而且读出来 `frombytes` 就能算，不用反序列化。入库时就把向量做了 L2 归一化，检索时点积就等于余弦相似度，省掉每次查询给全库算模长的开销。
+>
+> 我也清楚它的边界：现在是全表扫描，上万块就该上 ANN 索引；不支持并发写，多 worker 会锁库；容器里部署是临时的，重新部署会清空。如果真要上线到能扛量的场景，我会换 Postgres + pgvector，检索接口不用动，只是把存储层换掉——这也是我当初把 `search()` 和存储分开写的原因。
+
+### 检索质量实测
+
+用本仓库 README 入库（600 字切片，81 块），问「限流和每日配额是怎么实现的」：
+
+| 排名 | 分数 | 命中内容 | 判断 |
+|---|---|---|---|
+| 1 | **0.6737** | 限流的三条坑（先扣费再校验 / XFF 可伪造 / 进程内存） | 正确 |
+| 2 | 0.6244 | 全站额度 `MAX_CALLS_PER_DAY_GLOBAL` 的成本估算 | 相关 |
+| 3 | 0.5972 | Pydantic 入参校验 | 边缘相关 |
+
+**验证它是语义匹配、不是关键词匹配**：库里那篇讲青海湖的文档写的是"环青海湖国际公路自行车赛，是亚洲顶级自行车赛事之一"。问「亚洲顶级的自行车比赛在哪里办」——问句里没有"青海湖"三个字，仍然以 **0.5827** 命中该块，第二名才是无关内容（0.4211）。
+
+### 检索评测：切片参数 × 检索模式（20 题 × 6 组）
+
+`eval_retrieval.py` 用 20 条问题（每条带唯一锚点字符串）跑三组切片参数、两种检索模式，产物在 `docs/retrieval-eval.md`。
+
+| chunk_size | 模式 | 块数 | top1 | top3 | MRR |
+|---|---|---|---|---|---|
+| 300 | 纯向量 | 201 | 35% | 50% | 0.417 |
+| 300 | **混合** | 201 | 45% | 60% | 0.517 |
+| 400 | 纯向量 | 140 | 30% | 50% | 0.400 |
+| 400 | **混合** | 140 | 50% | 75% | 0.608 |
+| 600 | 纯向量 | 81 | 50% | 65% | 0.567 |
+| **600** | **混合（现线上）** | 81 | **55%** | **85%** | **0.683** |
+
+**这不是一张好看的分数表，是一张驱动了两次改动的诊断表。**
+
+**改动一：先把失败分类，再说难不难**
+未命中被分成三类，每类的改法完全不同：
+
+| 失败类型 | 表现 | 改法 |
+|---|---|---|
+| **相邻块** | 正确内容在块 53，top1 是块 52 | 答案被块边界切走 → 调 chunk_size |
+| **词面相似但语义不同** | 问"切片为什么重叠"，top1 是讲前端"按空行切事件"的段落 | 纯向量区分度不够 → 混合检索或 rerank |
+| **只提关键词不含答案** | 问"换 Redis 怎么保证原子"，top1 是「已知限制」里那句"下一步换 Redis"，比真答案高 0.007 | 关键词命中要能被正确加权 |
+
+**改动二：加混合检索，同一把尺子量前后**
+`search()` 现在默认跑两路：向量余弦 + BM25 关键词，用 **RRF（秩融合，k=60）** 合并。
+三个理由：
+
+| 决定 | 原因 |
+|---|---|
+| **加关键词这一路** | 纯向量对"术语密度高但没答案"的清单式段落没有免疫力；关键词那路恰好补这个，但它怕同义换述。两路互补 |
+| **用 RRF 不用加权求和** | 余弦是 0~1 的量，BM25 没有上界。加权求和必须先把两者归一化，而归一化方式本身就是个要调的参数。RRF 只用名次，天然可比 |
+| **平局以关键词分为准** | 只有两条候选时 RRF 会对称（一条余弦第一关键词第二，另一条反之，fused 完全相等），没有裁决规则结果就是随机顺序。字面精确命中比余弦更可信 |
+
+效果（同一批库、同一批问题）：top1 全面提升，**top3 从 50–65% 提到 60–85%**，MRR 0.400→0.683。
+top3 的提升最实用——Agent 的 `search_kb` 是把 top_k 条一起交给模型，正确答案进候选就很有用。
+
+**一条方法上的教训**：标准答案必须用「锚点字符串」而不是「块编号」。块编号随切片参数变化，换参数基准就全废了；这是能跨参数比较的前提。
+
+诚实清单：1 篇语料、20 题，样本量小；全是正例，没有"库里没答案会不会瞎编"的负例；没做 rerank 的对比组；BM25 用二字滑窗代替分词器，对生僻词会有噪声。
+
+### 部署注意
+
+Render 的文件系统是只读的（除了 `/tmp`），所以线上要把库指到可写目录：
+
+```
+KB_DIR=/tmp/kbdata
+```
+
+代价是**重新部署会清空知识库**（`/tmp` 是临时的）。要长期保存得挂持久磁盘，或者按"启动时从对象存储拉一次词库"的方式预热。本地开发不用管，默认写 `data/kb.sqlite3`。
+
+---
+
+## 怎么给别人用
+
+`uvicorn app:app` 默认只绑 `127.0.0.1`，**只有本机能开**。要让别人访问，看你要给谁用：
+
+| 场景 | 用什么 | 成本 | 代价 |
+|---|---|---|---|
+| **有自己的域名（最推荐）** | `python share.py --named` | 0 | 电脑要开着；地址永久不变 |
+| 同一个 WiFi / 校园网（同学、室友、面试现场） | `python share.py` | 0 | 对方必须在同一个网络 |
+| 临时发个链接给人看一眼 | `python share.py --tunnel` | 0 | 地址每次变，你电脑不能关 |
+| 不想靠自己的电脑 | 云服务器 / Render / Railway | 有免费档 | 要配环境变量、可能休眠 |
+
+### 一、局域网（最快，5 秒）
+
+```bash
+python share.py
+```
+
+脚本会打印两个地址：
+
+```
+你自己打开：       http://127.0.0.1:8000
+同一个 WiFi 的人：  http://10.160.220.105:8000     ← 把这个发出去
+```
+
+> 内网 IP 每换一次网络就会变（家里 / 宿舍 / 教室各不同），所以必须现查。查法有讲究：
+> 只靠「连一下外网看系统选哪块网卡」在开了 **Clash / V2Ray 的 TUN 模式**时会返回 `198.18.0.1`（fake-IP 网关），
+> 在装了 **VirtualBox** 的机器上会返回 `192.168.56.1`（Host-Only 网卡）——这两个地址别人都连不上。
+> 现在改成先枚举本机所有 IPv4，排除虚拟网段（`198.18.0.0/15`、`192.168.56.0/24`、`172.17.0.0/16`、`169.254.0.0/16`），
+> 再从剩下的 RFC1918 私网地址里挑，拿不到才退回原来的方法。
+
+第一次启动 Windows 会弹「是否允许 Python 访问网络」，必须点**允许**，否则别人能连上但页面打不开。
+
+### 二、固定域名（Cloudflare Tunnel，推荐）
+
+有自己的域名时用这个：地址永久不变，写进简历、发给面试官都行。
+
+```bash
+python share.py --named
+```
+
+```
+  AI 摘要服务已启动（端口 8001）
+
+  你自己打开：       http://127.0.0.1:8001
+  同一个 WiFi 的人：  http://10.160.220.105:8001
+  固定域名：         https://ai.example.com
+       ↳ 地址永久不变；电脑睡眠 / 断网会断，醒来重跑这条命令即可
+```
+
+**一次性配置**（只做一次，之后每次只要上面那条命令）：
+
+```bash
+# 1. 登录（会打开浏览器，选你的域名授权）
+cloudflared tunnel login
+
+# 2. 建隧道
+cloudflared tunnel create ai-summary
+
+# 3. 在 ~/.cloudflared/config.yml 里写 ingress 规则，把域名指到本地端口
+#    tunnel / credentials-file 填第 2 步给你的隧道名和 uuid
+#    ingress:
+#      - hostname: ai.example.com
+#        service: http://127.0.0.1:8001
+#      - service: http_status:404
+
+# 4. 建 DNS 记录（CNAME → <uuid>.cfargotunnel.com，自动开橙云）
+cloudflared tunnel route dns ai-summary ai.example.com
+```
+
+配置写完 `python share.py --named` 会自动从 `config.yml` 里读出映射到当前端口的域名并打印，不用手记。
+
+几个要点：
+
+- **端口别用 8000**：`--named` 默认 8001。同一个隧道可以挂多个域名（各指不同端口），但两个服务用同一个端口，先起的那个会把端口占死（`[Errno 10048]`）。
+- **一个隧道挂多个域名**是标准做法，加服务就在 `ingress` 里加一条 `hostname`，不用再建隧道、不用多跑一个进程。
+- **橙云是正常的**：`route dns` 建出来的记录默认走 Cloudflare 代理（橙云），HTTPS 由 CF 提供，隧道后端无所谓。
+- **关机 / 睡眠就断**，重跑命令即可，域名不用改。
+
+### 三、公网临时链接（发微信就能用）
+
+```bash
+python share.py --tunnel
+```
+
+多出来一行：
+
+```
+公网链接（谁都能开）： https://illustrated-rss-assembled-encoding.trycloudflare.com
+```
+
+走的是 Cloudflare 快速隧道，不用公网 IP、不用域名、不用注册账号，HTTPS 也是自动的。没装 cloudflared 的话：`winget install --id Cloudflare.cloudflared`。
+
+三个必须知道的限制：
+
+1. **关掉就失效**，重启会换一个新地址——它不是永久部署，只适合当场给人看一眼。
+2. **电脑睡眠 / 断网就断**，因为服务跑在你自己机器上。
+3. **新域名下「云服务」链路和顶部统计会失效**：云端只认白名单里的域名，别家的 Origin 一律拒绝（浏览器报 `Failed to fetch`）。主链路「我的 Key」不受影响，页面也会自动把云服务选项标灰。要用云服务链路，得去云服务后台把新域名加进白名单。
+
+### 四、长期部署（Render，可选）
+
+仓库根目录已经有 `render.yaml`（Blueprint），配置和代码放在一起，不用在网页上凭记忆填环境变量。
+
+**步骤**
+
+1. Render 控制台 → **New → Blueprint** → 选 GitHub 仓库 `ai-summary-bot`
+2. Render 读 `render.yaml` 自动建服务，只让你填 **`API_KEY`**（`sync: false` 的项）
+3. 等构建完成，拿到 `https://<服务名>.onrender.com`
+
+`API_KEY` 必须手填——仓库里没有 `.env`（被 `.gitignore` 拦住），`render.yaml` 里也只写了 `sync: false` 不写值。**密钥一旦写进仓库文件就等于公开**，这条没有例外。
+
+**免费档要知道的两件事**
+
+| 限制 | 影响 |
+|---|---|
+| 15 分钟没流量就休眠 | 休眠后第一次访问要等 **约 50 秒** 冷启动。面试前先自己访问一次把它叫醒 |
+| 实例 IP 共享、内存 512 MB | 够跑这个服务；但限流账本在进程内存里，重启清零 |
+
+**只改 `render.yaml` 里这三行就能换厂商：**
+
+```yaml
+- key: API_BASE_URL
+  value: https://dashscope.aliyuncs.com/compatible-mode/v1
+- key: MODEL_NAME
+  value: deepseek-v4.1-flash
+- key: DISABLE_THINKING
+  value: "1"
+```
+
+**Render 后面取真实 IP 的细节**：Render 是反向代理，`request.client.host` 拿到的是内网地址。`client_ip()` 会自动识别"来源是内网 → 说明有反代"，然后**从 X-Forwarded-For 右边往左找第一个公网地址**。之所以不是直接取最后一段：Render 会把代理自己的内网地址追加在末尾，直接取最后一段会让所有访客算成同一个 IP，20 次/天的限额被几十个人瞬间分完。这条逻辑有 8 个单测覆盖（公网来源忽略 XFF、跳过尾部代理、多级代理、全内网兜底、伪造非 IP 串、`TRUST_PROXY` 强制）。
+
+### 五、如果走 Render：给它绑自定义域名
+
+> 已经用第二节的 Cloudflare Tunnel 就不用看这节——隧道本身就是给域名用的，不存在"再绑一次"。
+> 这节只适用于「服务跑在 Render 上，想让域名指过去」的情况。
+
+有域名的话就别用 `onrender.com` 那个地址了——简历上和名片上都不好看，而且免费实例换服务名就变。
+
+**1. Render 侧：加 Custom Domain**
+
+服务页 → Settings → Custom Domains → Add Custom Domain → 填子域名，比如 `ai.example.com`。
+Render 会返回一个 CNAME 目标值，通常是 `<服务名>.onrender.com`。
+
+**2. Cloudflare 侧：加 CNAME 记录**
+
+DNS → Records → Add record：
+
+| 字段 | 值 |
+|---|---|
+| Type | `CNAME` |
+| Name | `ai`（只填前缀，CF 会自动补全域名） |
+| Target | `<服务名>.onrender.com`（Render 给的那个） |
+| Proxy status | **DNS only（灰云）** ← 关键 |
+
+**3. 回 Render 点 Verify，等证书签发（几分钟）**
+
+**为什么必须灰云（DNS only）**
+
+Cloudflare 橙云会在 Render 前面再加一层代理，Render 签发 Let's Encrypt 证书时做的域名验证会被 CF 拦掉，结果是「域名能开但证书报错」或者干脆 522。要开橙云也不是不行，但得把 SSL/TLS 模式改成 Full (strict) 且 Render 侧证书已签好——多一层配置多一个坏点，对一个演示服务不划算。
+
+**绑完后会掉一条链路，这是预期内的**
+
+新域名等于新 Origin，云端白名单里没有它 → 「云服务」链路会被拒（`Failed to fetch`），顶部统计也读不到。主链路「我的 Key」完全正常。
+
+页面已经处理了这种情况：`refreshStats()` 一旦失败就把云服务选项标灰并挂上原因提示，不会让你点了才撞墙。要让云服务链路也恢复，去云服务后台把 `ai.example.com` 加进白名单即可。
+
+### 六、Docker（自托管 / 任意云主机）
+
+```bash
+docker compose up -d --build      # 起服务
+docker compose logs -f            # 看日志
+docker compose down               # 停（数据留在卷里，不会丢）
+```
+
+访问 `http://127.0.0.1:8000`。密钥从 `.env` 读（`env_file`），不写进 compose。
+
+> ✅ **验证状态：已在本机真实 build 并跑通**（Docker Desktop 4.97 / Engine 29.9.2 / WSL2 后端）
+>
+> | 验证项 | 结果 |
+> |---|---|
+> | `docker build` | 成功，镜像 206 MB |
+> | `docker compose up -d` | 容器 `Up (healthy)`，healthcheck 生效 |
+> | `/api/health` | 200，`configured: true`（`.env` 正确注入） |
+> | `/api/summarize/stream` | `text/event-stream`，首字 468 ms，6 个增量 |
+> | 知识库入库 | 写入卷 `/data/kb.sqlite3`（36864 字节） |
+> | `compose down` → `up` | **文档与向量仍在**，检索 0.4254 |
+> | 运行用户 | `uid=10001(appuser)`，非 root |
+> | `/app/logs/app.log` | 归 appuser，权限问题未发生 |
+
+**拉不到 Docker Hub 时的做法**（本机实测，国内网络常见）：`registry-1.docker.io` 会超时，而 Docker Desktop 默认没有 HTTPS 代理。绕法是先从国内镜像源拉基础镜像再打回原名，Docker 见到本地已有同名 tag 就不会再去 Hub 拉：
+
+```bash
+docker pull docker.m.daocloud.io/library/python:3.12-slim
+docker tag docker.m.daocloud.io/library/python:3.12-slim python:3.12-slim
+docker build -t ai-summary-bot:local .      # 之后正常 build
+```
+
+**三个必须这么写的理由**
+
+| 决定 | 原因 |
+|---|---|
+| **命名卷 `kb-data:/data`，不用 bind mount** | 知识库是 sqlite 文件，容器一删就没了。命名卷由 docker 管理，Windows/macOS 上不用操心路径与属主；bind mount 到宿主机目录会把镜像里设好的 `appuser` 权限覆盖掉，经常一挂载就 `Permission denied` |
+| **非 root 运行，且先 `mkdir /app/logs /data` 再 chown** | `main.py:84` 是 `os.makedirs("logs")` + `FileHandler("logs/app.log")`，路径**相对 CWD**。以非 root 跑而 `/app` 归 root 时，这一行在 import 阶段就抛 `PermissionError`，容器直接退出，日志里只有一行 Traceback。这是本项目最容易踩的 Docker 坑 |
+| **只拷 Web 需要的文件，排除 `batch.py`** | `batch.py` 依赖 pandas，而 Web 镜像装的是 `requirements-web.txt`（不含 pandas，体积小很多）。已验证导入 `app` 时 pandas 和 batch 都不会被加载（`import batch` 在 `run_batch()` 内部，是延迟导入）。代价是容器里跑不了 `python main.py --input`——那是 CLI 的活，用本地环境跑 |
+
+**另外两个细节**
+
+- `PYTHONUNBUFFERED=1`：不加的话 stdout 被缓冲，`docker logs` 看不到实时输出，出问题只能等进程退出才刷出来
+- 健康检查不装 curl（slim 镜像没有），直接用 `python -c` 打 `/api/health`；`CMD` 用 shell 形式才能展开 `${PORT}`
+
+### 公开之前先想一件事
+
+**别人用的是你的 API 额度。** 目前的口子是每 IP 每天 20 次 + 全站每天 300 次（`app.py` 顶部改）。按 `deepseek-v4.1-flash` 的价格，全站刷满一天也就是几毛钱，可接受；但如果你换成贵模型，先把 `MAX_CALLS_PER_DAY_GLOBAL` 调小再发链接。
+
+另外限流记录的是**进程内内存**：服务重启清零，`--workers N` 会失效成 N 倍。真要长期开放，先把账本换 Redis。
+
+---
+
+## 运行测试
+
+测试**不会真的调用 API**（不花钱、不联网、结果稳定）：用 `monkeypatch` 把 `requests.post` 换成假函数，人为造出 200 / 401 / 429 各种响应；Web 层则把 `Summarizer` 换成固定返回的替身。
+
+```bash
+python -m pip install -r requirements-dev.txt   # 含 TestClient 需要的 httpx2
+python -m pytest -q        # 想看每条用例的名字，加 -v
+```
+
+预期输出：
+
+```
+tests\test_app.py ..........................                             [ 41%]
+tests\test_main.py ....................................                  [100%]
+
+============================= 75 passed in 2.35s ==============================
+```
+
+- `tests/test_main.py`：摘要内核 + 流式客户端。重试策略、SSE 解析（心跳/坏包/`[DONE]`）、流式只重试建连、句数收窄、排版规整、配置解析。
+- `tests/test_app.py`：HTTP 壳。限流、扣费时机、真实 IP 判定（含多级代理 XFF）、知识库扣费时机、流式事件格式与错误前置、响应字段。这一层以前没有测试，所以「伪造 XFF 绕过限额」「空白正文白扣额度」两个问题上线时都没被发现。
+
+36 条内核用例，主要分成这几类：
+
+| 类别 | 覆盖内容 |
+|---|---|
+| 提示词拼装 | `--length` 是否真的写进了系统提示词 |
+| 网络行为 | 正常返回；401 立即失败且**只请求 1 次**；429 重试成功后共请求 3 次（并断言退避时长为 `[1.0, 2.0]`）；404 的报错信息必须提示去检查配置 |
+| 配置解析 | URL 归一化 5 种输入、默认值、新旧变量名优先级、空字符串回退、缺 key 直接退出 |
+
+> ⚠️ 测试文件只能用 `pytest` 跑，**不要用编辑器右上角的 ▶ 运行**——那是「当脚本执行」，`sys.path` 里只有 `tests/`，会报 `ModuleNotFoundError: No module named 'main'`。
+
+---
+
+### 持续集成
+
+每次推 `main` 或提 PR，GitHub Actions 自动跑一遍这 75 条测试（`.github/workflows/test.yml`，实测 18 秒）。
+
+CI 里**不注入 `API_KEY`、也不建 `.env`**——故意的：CI 不该有真密钥，而且测试本身用 `monkeypatch` 换掉了 `requests.post` 和 `get_client`，不依赖任何真实配置。这条约束反过来验证了一件事：**测试没有偷偷依赖本地 `.env`**。本地已实测过：临时移走 `.env` 后仍是 75 passed。
+
+CI 只做测试、不做构建和部署——仓库已有 Render Blueprint 和 Docker Compose 两套部署方式，再加一层只会多一个坏点。测试是唯一"每次都要跑、跑错代价最高"的环节。
+
+---
+
+## 项目结构
+
+```
+ai-summary-bot/
+├── main.py                  # 主程序：Config / LLMClient / Summarizer 三个类
+├── agent.py                 # Agent：工具注册表 + 多步循环 + trace（复用 main 的客户端与摘要器）
+├── kb.py                    # 知识库：切片 / 向量化 / sqlite 存储 / 余弦检索（也能单独 CLI 用）
+├── agent_store.py           # Agent 轨迹落库：runs + steps 两表、保留上限、按工具聚合
+├── eval_retrieval.py        # 检索评测：20 题 × 3 组切片参数，产出对比表与失败分类
+├── batch.py                 # 批量模式：读表 → 逐行摘要 → 断点续跑 → 写表
+├── app.py                   # Web 服务：FastAPI 外壳 + 单页前端
+├── share.py                 # 一键分享：绑 0.0.0.0 + 打印内网 IP（可选公网隧道）
+├── web/
+│   ├── index.html           # 单页前端：两条链路、流式渲染、复制、快捷键
+│   ├── agent.html           # Agent 演练场：指令输入 + trace 时间线
+│   └── kb.html              # 知识库：上传文档 / 文档列表 / 检索测试
+├── data/                    # sqlite 知识库（运行时生成，已 gitignore）
+├── docs/
+│   ├── retrieval-eval.md    # 检索评测报告（由 eval_retrieval.py 生成）
+│   └── screenshots/         # 运行截图（结果页、Agent trace、知识库）
+├── render.yaml              # Render 部署配置（Blueprint，一键建服务）
+├── Dockerfile               # 生产镜像：非 root + 依赖分层 + 健康检查
+├── docker-compose.yml       # 起服务 + 命名卷挂知识库（数据不随容器消失）
+├── .dockerignore            # 排除 .env / .venv / corpus / 测试与文档
+├── .github/workflows/
+│   └── test.yml             # CI：每次推送跑 75 条测试，不注入真密钥
+├── build_corpus.py          # 数据准备：corpus/*.txt → data.csv
+├── fetch_corpus.py          # 语料采集：从公开接口补够 30 篇（带节流与清洗）
+├── sample.txt               # 示例文本
+├── requirements.txt         # 运行依赖
+├── requirements-web.txt     # Web 服务依赖（不含 pandas，部署更快）
+├── requirements-dev.txt     # 开发依赖（pytest）
+├── pytest.ini               # pytest 配置（pythonpath / testpaths）
+├── pyrightconfig.json       # 类型检查配置（让 IDE 认识 import main）
+├── conftest.py              # 把项目根加进 sys.path
+├── tests/
+│   ├── test_main.py         # 36 个单元测试：摘要内核、SSE 解析、流式重试策略
+│   ├── test_app.py          # 30 个用例：限流、扣费时机、真实 IP 判定、知识库扣费、流式接口、轨迹落库
+│   ├── test_kb.py           # 9 个用例：分词、混合检索融合与平局裁决、切片参数入口
+│   └── README.md            # 测试写法讲解
+├── corpus/                  # 语料 30 篇（有版权，已 gitignore）
+│   ├── 001~030.txt          # 标题 + 空行 + 正文
+│   └── index.tsv            # 文件名/字数/日期/标题/原文链接
+├── learn_oop.py             # 学习笔记：OOP 对照示例
+├── learn_decorator.py       # 学习笔记：闭包与装饰器 6 步对照示例
+└── logs/                    # 运行日志（已 gitignore，不入库）
+    └── app.log
+```
+
+---
+
+## 摘要有两句额外处理
+
+**① 句数按字数自适应，不硬凑**
+
+| 正文字数 | 最多几句 |
+|---|---|
+| < 200 | 2 |
+| 200 ~ 599 | 3 |
+| 600 ~ 1499 | 4 |
+| ≥ 1500 | 5 |
+
+原文只有 69 个字却要 5 句，模型只能把一句劈成两句（实测出现过「……气候干燥。冬季寒冷。」）。
+所以先按字数收窄，收窄时命令行打日志、接口返回 `sentences_used`、网页在标题后注明「按 N 句给出」。
+
+**② 输出要规整，别把模型的排版习惯直接给用户**
+
+模型爱把几句话写成 `- 第一句` / `- 第二句`，句子之间还插空行。这些在纯文本摘要里是噪音，
+网页按 `pre-wrap` 渲染还会变成难看的空档。`normalize_summary()` 做三件事：
+
+- 去掉行首列表符（`- ` `* ` `1. `）
+- 丢掉空行后接行：**中文接中文不加空格**（加了会变成"每 句 都 有 缝"），英文之间保留一个空格
+- 删掉中文标点前后的空格
+
+---
+
+## 设计说明
+
+这几条是面试时最容易追问的，也是这个项目真正有含量的地方。
+
+**1. 为什么把错误分成 `RetryableError` 和 `FatalError` 两类？**
+
+不是所有失败都值得重试。超时、网络抖动、429 限流、5xx 是**暂时性**的，等一下可能就成功；而 401（key 错）、402（余额不足）是**确定性**的，重试 100 次结果一样，只会拖慢速度、浪费额度。所以先给错误分类，再让重试逻辑只处理可恢复的那类。
+
+**2. 为什么用装饰器实现重试，而不是在 `chat()` 里写 `for` 循环？**
+
+重试是**横切关注点**——日志、计时、鉴权同理：任何函数都可能需要，但都不属于业务逻辑本身。写成装饰器后，`@retry(max_tries=3, backoff=1.0)` 一行就加上能力，`chat()` 内部一行都不用改；以后要给别的函数加重试，也是加一行。
+
+实现上是三层嵌套：`retry(收参数) → decorator(收函数) → wrapper(真正执行)`。带参数的装饰器比无参的多一层，那一层只为收参数。另外用 `@functools.wraps` 保留原函数的名字和文档字符串。
+
+**3. 为什么测试里要把 `requests.post` 换成假函数？**
+
+三个原因：① 每次真调用都花钱，跑几轮测试就烧掉几块；② 网络会抖，测试结果不稳定（这次过下次不过，即 flaky test）；③ 想验证「429 限流时会重试」，总不能真去把服务商惹毛。
+
+所以用 `monkeypatch.setattr(main.requests, "post", fake_post)` 在运行时把真函数换掉，由测试自己决定返回 200 还是 429，pytest 会在测试结束后自动还原。
+
+> 这也解释了为什么主代码写 `import requests` + `requests.post(...)`，而不是 `from requests import post`——只有前者能被打补丁。
+
+**4. 为什么日志用 `logging` 而不是 `print`？**
+
+判据只有一条：**给用户看的输出用 `print`，给开发者看的记录用 `logging`。**
+
+摘要正文必须 `print`（用户要看到）；「第 2 次失败，2 秒后重试」必须 `logging`（用户不关心，但排障要查）。`logging` 还带来三个 `print` 做不到的事：分级别（INFO / WARNING / ERROR）、带时间戳、能同时输出到终端和文件。程序凌晨跑批量任务失败了，第二天能翻日志查原因，而不是面对一个空白的终端。
+
+**5. 为什么 `FileHandler` 要写 `encoding="utf-8"`？**
+
+Windows 上 `FileHandler` 默认用系统编码（GBK）写文件，中文日志会乱码，甚至直接抛 `UnicodeEncodeError`。这是 Windows 上的经典坑。
+
+**6. 怎么做到"换厂商不用改代码"？**
+
+调用大模型本质上只有三件事：**发给谁**（base_url）、**用哪个模型**（model）、**拿什么钥匙**（key）。这三样全部通过环境变量注入，代码里只留下"协议"这一层抽象——也就是 OpenAI 兼容协议。于是：
+
+```python
+# 业务代码完全不知道 DeepSeek 的存在，只知道"有一个 OpenAI 兼容端点"
+return cls(api_key=key, api_url=normalize_api_url(base_url), model=model)
+```
+
+这就是依赖倒置最朴素的样子：**依赖抽象（协议），而不是依赖具体实现（某家公司）**。带来三个实际好处：
+
+1. 切厂商 = 改环境变量，出问题的排查范围缩小到"配置"而不是"代码"
+2. 本地能用 Ollama 跑（`http://localhost:11434/v1`），不联网、不花钱地做冒烟测试
+3. 某个服务商挂了/涨价了，切走只要几秒钟
+
+配置解析本身也做了防御：用户填的地址可能是 `https://api.deepseek.com/v1`（要补路径）、也可能是完整 URL（不能重复补）、还可能带着多余斜杠或空格。`normalize_api_url()` 把这些差异都消化在**边界**上，让 `chat()` 里的 `requests.post()` 永远只拿到干净输入。空字符串也做了回退——因为 Windows 上 `$env:X=""` 恰好会留下一个"存在但为空"的变量，`os.getenv("X", 默认值)` 在这里会失效，必须用 `os.getenv("X") or 默认值`。这类边界情况正是配置代码最容易翻车的地方，所以专门为它写了 10 条测试。
+
+**7. 为什么"失败"也要设计？**
+
+这是真正动手跑才暴露出来的问题，光看代码看不出来：
+
+- **退出码**：原来无论成功失败都返回 `0`。人看屏幕知道挂了，但脚本和 CI 不知道——批量跑 100 个文件的摘要，最后"全部成功"的假象会一路骗到部署。改成失败时 `raise SystemExit(1)`，成功才 `0`。**能被机器识别的失败，才算真的失败。**
+- **报错要说人话**：只换端点忘了换模型名，服务端回一句 `model_not_found`，原来的代码原样转发，用户得自己去猜。现在 404 单独处理，直接把两行的 `API_BASE_URL` 和 `MODEL_NAME` 写进提示；再加上启动时那行 `🤖 模型：... ｜ 端点：...`，配置错位一眼可见。
+
+顺带还修了个小瑕疵：原来「--- 摘要结果 ---」这个标题在**发请求之前**就打出来了，一失败就会出现"有标题没内容"的尴尬画面。现在改成先拿到结果、成功了再打印标题和正文——**顺序正确了，也就不会留下半截输出。**
+
+---
+
+## 已知限制 / 后续计划
+
+- [x] ~~只支持 DeepSeek 一家~~ → v0.5 已支持任意 OpenAI 兼容服务
+- [x] ~~尚无 Web 界面~~ → v2.0 已上线：FastAPI + `web/index.html`，支持两条链路、流式渲染、云端统计
+- [x] ~~只支持单文件~~ → v1.1 已支持批量 CSV（`batch.py`，断点续跑）
+- [x] ~~调用记录只落日志~~ → v2.0 起元数据同时写入云端表 `summary_stats`（字数/耗时/模型名，不存正文）
+- [ ] 不校验 `API_KEY` 的长度/格式，填错了要靠 API 返回 401 才发现
+- [ ] 主流程没有 `--model` 命令行参数，换模型得改环境变量（README 里写了怎么换）
+- [ ] 限流账本在进程内存里，多 worker 部署会各记一份；下一步换 Redis
+- [ ] 统计条的平均耗时/今日次数只取最近 200 条样本，记录多了会有偏差；下一步改成服务端聚合
+- [ ] 只有一套 prompt；计划做两套方案对比评测并产出数据报告 → **v2.1**
+- [ ] Agent 的额度口径粗糙：一次请求内部可能 2-6 次模型调用，但只扣 1 次额度 → 按 token 或步数计费
+- [x] ~~Agent 的 trace 只返回给前端、不落库，刷新即丢~~ → 已落库：`runs` + `steps` 两张表，配列表 / 详情 / 工具聚合三个接口
+- [ ] Agent 无工具结果缓存，同样的参数可能被重复调用 → 加一次会话内的结果缓存
+- [x] ~~`/agent` 没有首页入口，只能手敲地址~~ → 首页页头右上角已加「试试 Agent 模式」入口（360px 窄屏实测仍在一行内，不溢出）
+- [ ] 知识库每次检索都会全表扫描算点积。几千块没问题，上万块就该上索引（如 faiss / hnswlib）或加一层粗筛
+- [x] ~~检索是纯向量，没有混合检索~~ → 已加：向量余弦 + BM25 关键词，RRF 秩融合（top3 由 50–65% 提到 60–85%）。仍缺 rerank
+- [ ] 没有 rerank。top_k 取回来就这顺序，加一层 cross-encoder 重排通常还能再提一截
+- [x] ~~切片参数没做消融对比~~ → 已补评测（`eval_retrieval.py`，20 题 × 300/400/600 三组，产物 `docs/retrieval-eval.md`）。结论见下方「检索评测」一节
+- [x] ~~知识库存在本地 sqlite，线上重新部署即清空~~ → 给了 Docker 方案（`docker-compose.yml` 里 `kb-data:/data` 命名卷），容器重启/重建数据都在；但 Render 免费档仍只能用 `/tmp`，那条路要挂磁盘或接对象存储
+- [x] ~~Docker 镜像尚未在本机 build 验证~~ → 已在本机 build 并跑通：容器 healthy、流式可用、`compose down/up` 后知识库仍在、运行用户为 uid 10001 非 root
+- [ ] 流式链路不做句数纠正（重写会把已显示的内容整段替换），句数不准时只能提示 → 需要严格句数请用同步接口
+- [ ] 流式没有做"中途取消"的服务端处理：前端 abort 后，上游那条连接要等模型自己结束才会释放 → 接 `request.is_disconnected()` 主动断开
+
+---
+
+## 开发过程
+
+按周推进，每周的产出都落在 git 提交里：
+
+| 版本 | 内容 |
+|---|---|
+| v0.1 | 命令行调通，支持 `--file` 读取与 API 错误处理，**上线 GitHub** |
+| v0.2 | 按职责拆成 `Config` / `LLMClient` / `Summarizer` 三个类，异常分级 |
+| v0.3 | 新增 `@retry` 装饰器，指数退避 + 只重试可恢复错误 |
+| v0.4 | `print` 改造为 `logging`，日志落盘 `logs/app.log` |
+| v0.5 | 配置全部环境变量化，支持任意 OpenAI 兼容服务（DeepSeek / 百炼 / OpenAI / 本地 Ollama）；配置解析加 10 条测试；修掉实测暴露的 3 个问题（失败退出码、404 提示、成功才打印标题） |
+| **v1.0** | 补 pytest 单元测试，README 完整化，打 tag 发布 |
+| v1.1–v1.5 | 批量模式（CSV + 断点续跑）、语料构建、FastAPI 服务化、限流与配额、Render 部署、Cloudflare Tunnel 分享 |
+| **v2.0** | **Agent 工具调用**：工具注册表 + 多步循环 + 步数上限 + trace 可视化（`/agent` 页面 + `POST /api/agent`） |
+| **v2.1** | **知识库向量检索**：切片 + 1024 维向量 + sqlite BLOB 存储 + 余弦检索，`/kb` 页面，并作为 `search_kb` 工具接进 Agent |
+| **v2.2** | **服务端流式**：`chat_stream()` + SSE 解析 + `/api/summarize/stream` + 前端逐字渲染；只重试建连、错误前置，流式不做句数重写 |
+| **v2.3** | **容器化**：Dockerfile（非 root + 依赖分层 + python 健康检查）+ compose 命名卷挂知识库；已在本机 build 并验证容器重建后数据不丢 |
+| **v2.4** | **Agent 轨迹落库**：`runs` + `steps` 两表 + 保留上限淘汰，三个查询接口（列表 / 详情 / 按工具聚合），`/agent` 页面加历史记录；落库失败不影响主流程 |
+
+> 提交粒度：一个功能一个分支（`feature/xxx`），完成后用 `--no-ff` 合并回 `main`，保留完整的合并记录。
+
+---
+
+## License
+
+MIT
