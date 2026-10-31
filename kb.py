@@ -258,9 +258,13 @@ def find_existing(conn: sqlite3.Connection, text: str) -> dict | None:
 
 
 def add_document(conn: sqlite3.Connection, name: str, text: str,
-                 config: Config | None = None) -> dict:
+                 config: Config | None = None,
+                 chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> dict:
     """
     入库一篇文档。已存在（内容指纹相同）就直接返回旧的，不重复消耗 embedding 额度。
+
+    chunk_size / overlap 暴露成参数是为了能做参数对比（评测脚本要按不同块大小建库）。
+    默认值仍是模块常量，线上行为不变。
 
     返回 {"id", "name", "n_chunks", "skipped"}
     """
@@ -269,7 +273,7 @@ def add_document(conn: sqlite3.Connection, name: str, text: str,
     if existing is not None:
         return {**existing, "skipped": True}
 
-    pieces = split_text(text)
+    pieces = split_text(text, chunk_size=chunk_size, overlap=overlap)
     if not pieces:
         raise ValueError("文档内容为空，切不出任何块")
 
