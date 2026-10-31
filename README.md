@@ -832,6 +832,16 @@ tests\test_main.py ....................................                  [100%]
 
 ---
 
+### 持续集成
+
+每次推 `main` 或提 PR，GitHub Actions 自动跑一遍这 62 条测试（`.github/workflows/test.yml`，实测 18 秒）。
+
+CI 里**不注入 `API_KEY`、也不建 `.env`**——故意的：CI 不该有真密钥，而且测试本身用 `monkeypatch` 换掉了 `requests.post` 和 `get_client`，不依赖任何真实配置。这条约束反过来验证了一件事：**测试没有偷偷依赖本地 `.env`**。本地已实测过：临时移走 `.env` 后仍是 62 passed。
+
+CI 只做测试、不做构建和部署——仓库已有 Render Blueprint 和 Docker Compose 两套部署方式，再加一层只会多一个坏点。测试是唯一"每次都要跑、跑错代价最高"的环节。
+
+---
+
 ## 项目结构
 
 ```
@@ -853,6 +863,8 @@ ai-summary-bot/
 ├── Dockerfile               # 生产镜像：非 root + 依赖分层 + 健康检查
 ├── docker-compose.yml       # 起服务 + 命名卷挂知识库（数据不随容器消失）
 ├── .dockerignore            # 排除 .env / .venv / corpus / 测试与文档
+├── .github/workflows/
+│   └── test.yml             # CI：每次推送跑 62 条测试，不注入真密钥
 ├── build_corpus.py          # 数据准备：corpus/*.txt → data.csv
 ├── fetch_corpus.py          # 语料采集：从公开接口补够 30 篇（带节流与清洗）
 ├── sample.txt               # 示例文本
