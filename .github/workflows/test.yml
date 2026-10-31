@@ -1,0 +1,55 @@
+name: tests
+
+# 只做一件事：每次推代码和提 PR，把 62 条测试跑一遍。
+#
+# 为什么不做构建/部署：这个仓库已经有两套部署方式（Render Blueprint + Docker Compose），
+# CI 再加一层只会多一个坏点。测试是唯一"每次都要跑、跑错代价最高"的环节，
+# 所以 CI 只锁这一件事，保持它快且不 flaky。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:        # 允许在网页上手动触发一次
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements-web.txt
+            requirements-dev.txt
+
+      # 不装 requirements.txt：那个含 pandas，只有本地批量模式 batch.py 用得上。
+      # CI 跑的是 Web 服务 + 内核的测试，装 pandas 纯属拖慢（实测能省 20 秒以上）。
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-web.txt -r requirements-dev.txt
+
+      # ★ 这里不注入 API_KEY，也不建 .env —— 故意的。
+      #   CI 里不该有真密钥（泄露风险），而且测试本身就用 monkeypatch 换掉了
+      #   requests.post 和 get_client，不依赖任何真实配置。
+      #   这条约束反过来验证了一件事：测试确实没有偷偷依赖本地 .env。
+      #   （本地已实测：临时移走 .env 后仍是 62 passed）
+      - name: 跑测试
+        run: python -m pytest -q
+
+      # 失败时把日志传上来，省得去翻网页控制台
+      - name: 失败时上传日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-output
+          path: |
+            .pytest_cache/
+            logs/
+          if-no-files-found: ignore
